@@ -62,10 +62,8 @@ type StackFrame struct {
 	LocalVars      *VarSet     // live local variables
 	Func           *FuncInfo   // function called for this frame
 
-	argsArea   dataSegment
-	argsBV     *gcBitvector
-	localsArea dataSegment
-	localsBV   *gcBitvector
+	argsBV   *gcBitvector
+	localsBV *gcBitvector
 }
 
 // Var describes a global or local variable. A Var is simply a named value.
@@ -111,7 +109,7 @@ func (a sortVarByAddr) Less(i, k int) bool { return a[i].Value.Addr < a[k].Value
 // VarSet describes a set of variables.
 type VarSet struct {
 	list  sortVarByAddr   // kept sorted
-	names map[string]*Var // indexed by full name (including the pkgPath)
+	names map[string]*Var // indexed by FullName (including the pkgPath)
 }
 
 // FindAddr looks up the variable that contains the given address.

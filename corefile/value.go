@@ -68,7 +68,7 @@ func (v Value) Size() uint64 {
 	return v.Type.Size()
 }
 
-// ContainsAddress reports whether addr is in [v.Addr, v.Addr+v.Type.Size()).
+// ContainsAddress reports whether addr is in [v.Addr, v.Addr+v.Size()).
 func (v Value) ContainsAddress(addr uint64) bool {
 	return v.Addr <= addr && addr < v.Addr+v.Type.Size()
 }
@@ -225,7 +225,7 @@ func (v Value) DerefArray() (Value, error) {
 	return fv.Deref()
 }
 
-// Index returns v’s n’th element. Fails with ErrOutOfBounds if n > v.Cap().
+// Index returns v’s n’th element. Fails with ErrOutOfBounds if n >= v.Cap().
 // Panics if v.Type is not ArrayType, SliceType, StringType, or ChanType.
 func (v Value) Index(n uint64) (Value, error) {
 	vcap, err := v.Cap()
@@ -330,10 +330,9 @@ func (v Value) Cap() (uint64, error) {
 	}
 }
 
-// ReadScalar parses v into a Go scalar value. NumericType becomes the corresponding
-// Go type, except that all integers have a fixed size -- int, uint, and uintptr are
-// parsed as intN and uintN, where N is the architecture-dependent size of that integer.
-// PtrType becomes uint64. ReadScalar will panic if called for any other type.
+// ReadScalar parses v into a Go scalar value. NumericType becomes the
+// corresponding Go type. PtrType becomes uint64. ReadScalar will panic
+// if called for any other type.
 func (v Value) ReadScalar() interface{} {
 	a := v.Type.Program().RuntimeLibrary.Arch
 
@@ -440,7 +439,7 @@ func (v Value) ReadUintFieldByName(name string) (uint64, error) {
 // If this is false, then updates to v.Bytes may segfault.
 // Always returns false if the core file was not opened in writable mode.
 //
-// Writing to a value allows updating a core file, for example, to sanitize private
+// Writing to a value allows updating a core file; for example, to sanitize private
 // or personally-identifying data.
 func (v *Value) IsWritable() bool {
 	ds, found := v.Type.Program().dataSegments.findSegment(v.Addr)

@@ -29,8 +29,8 @@
 //
 // * Deferred closures in StackFrames
 //
-// * Accessing free variables in closures (this might require a runtime and/or
-//   compiler change to support)
+// * Accessing typed free variables in closures (this might require a runtime
+// and/or compiler change to support)
 //
 // * Object roots via finalizers
 //
@@ -43,23 +43,23 @@
 // * Programs that used dynamically-loaded libraries
 //
 // * Core files in formats other than Linux/ELF and for architectures
-//   other than x86
+// other than x86
 //
 // TODO: Features that would make it easier to analyze core files:
 //
 // * DWARF output should contain info about function closure variables (I believe
-//   these are stored in runtimefuncval although I don't completely understand
-//   this quite yet.
+// these are stored in runtimefuncval although I don't completely understand this
+// quite yet.
 //
 // * Ideally, each DWARF type should have a link to the type's *runtime._type
-//   descriptor that is stored in the program's static data segments (for types
-//   that appear in the static itab list).
+// descriptor that is stored in the program's static data segments (for types
+// that appear in the static itab list).
 //
 // * Use of typedefs in the DWARF is a bit confusing: structs and other types have
-//   a name, but then there's often a typedef with the same name? The typedefs all
-//   seem unnecessary.
+// a name, but then there's often a typedef with the same name? The typedefs all
+// seem unnecessary.
 //
 // * DWARF output seems to be missing a few struct types in the runtime package.
-//   e.g., runtime.findfuckbucket.
+// e.g., runtime.findfuncbucket.
 //
 package corefile
