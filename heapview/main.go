@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -15,20 +14,49 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
-	"strings"
 	// TODO: use html/template
 	"text/template"
 
-	heapdump "github.com/tombergan/goheapdump"
+	"github.com/tombergan/goheapdump/corefile"
 )
 
 var (
-	serverPort   = flag.Int("port", 8080, "Port to run HTTP server")
-	verboseDebug = flag.Bool("debug", false, "Print verbose debugging info")
+	serverPort = flag.Int("port", 8092, "Port to run HTTP server")
+	debugLevel = flag.Int("debuglevel", 0, "debug verbosity level")
 )
 
-// dump is the loaded heap dump.
-var dump *heapdump.Dump
+var (
+	program    *corefile.Program
+	typeToID   = map[corefile.Type]int{}
+	typeFromID = map[int]corefile.Type{}
+)
+
+func getTypeID(t corefile.Type) int {
+	if id, have := typeToID[t]; have {
+		return id
+	}
+	id := len(typeToID) + 1
+	typeToID[t] = id
+	typeFromID[id] = t
+	return id
+}
+
+func getGoroutineID(g *corefile.Goroutine) int {
+	for k := 0; k < len(program.Goroutines); k++ {
+		if program.Goroutines[k] == g {
+			return k
+		}
+	}
+	panic(fmt.Sprintf("unknown goroutine %p %#v", g, g))
+}
+
+func getFrameDepth(sf *corefile.StackFrame) int {
+	var d int
+	for ; sf.Callee != nil; sf = sf.Callee {
+		d++
+	}
+	return d
+}
 
 // lookupParam looks up an integer value in r.URL's query.
 func lookupParam(q url.Values, param string, base int) (uint64, error) {
@@ -43,14 +71,19 @@ func lookupParam(q url.Values, param string, base int) (uint64, error) {
 	return x, nil
 }
 
-// linkObj creates a link to the /obj page for the given address.
-func linkObj(addr uint64) string {
-	return fmt.Sprintf("<a href=obj?addr=%x>0x%x</a>", addr, addr)
+// linkObj creates a link to the /obj page for the given address and type.
+func linkObj(addr uint64, t corefile.Type) string {
+	return fmt.Sprintf("<a href=obj?addr=%x&type=%d>0x%x</a>", addr, getTypeID(t), addr)
+}
+
+func linkValue(v corefile.Value) string {
+	return linkObj(v.Addr, v.Type)
 }
 
 // linkFrame creates a link to the /frame page for the given StackFrame, using name as the link text.
-func linkFrame(sf *heapdump.StackFrame, name string) string {
-	return fmt.Sprintf("<a href=frame?id=%x&depth=%d>%s</a>", sf.Addr(), sf.Depth(), name)
+func linkFrame(sf *corefile.StackFrame, name string) string {
+	gid := getGoroutineID(sf.Goroutine)
+	return fmt.Sprintf("<a href=frame?goroutine=%d&depth=%d>%s</a>", gid, getFrameDepth(sf), name)
 }
 
 // limitedWriter returns EOF after writing N bytes.
@@ -79,43 +112,146 @@ type varInfo struct {
 	Value string
 }
 
-func makeVarInfo(name string, v *heapdump.Value) varInfo {
-	info := varInfo{
-		Name: name,
-		Addr: linkObj(v.Addr()),
-		Type: v.Type.String(),
+func makeVarInfo(v corefile.Var) varInfo {
+	var buf bytes.Buffer
+	w := &limitedWriter{&buf, 1000}
+	isFirst := true
+	writeField := func(_ corefile.Value, name, value string) error {
+		var err error
+		if !isFirst {
+			_, err = fmt.Fprintf(w, "<br/>%s=%s", name, value)
+		} else {
+			_, err = fmt.Fprintf(w, "%s=%s", name, value)
+			isFirst = false
+		}
+		return err
+	}
+	if err := fmtValue(v.Value, "", writeField); err != nil {
+		buf.WriteString(" ...")
+	}
+	return varInfo{
+		Name:  v.Name,
+		Addr:  linkValue(v.Value),
+		Type:  v.Value.Type.String(),
+		Value: buf.String(),
+	}
+}
+
+func fmtValue(v corefile.Value, fieldName string, writeField func(v corefile.Value, name, value string) error) error {
+	switch v.Type.(type) {
+	case *corefile.SliceType, *corefile.ChanType:
+		if v.IsZero() {
+			return writeField(v, fieldName, "nil")
+		}
+		vv, err := v.DerefArray()
+		if err != nil {
+			log.Printf("error printing %s 0x%x: %v", fieldName, v.Addr, err)
+			return writeField(v, fieldName, "???")
+		}
+		v = vv
 	}
 
-	// Format the value.
-	var buf bytes.Buffer
-	err := v.Fmt(&limitedWriter{&buf, 1000}, &heapdump.FmtOptions{
-		CustomScalarFormatter: func(w io.Writer, v *heapdump.Value) error {
-			if _, ok := v.Type.(*heapdump.PtrType); ok {
-				if addr, err := v.ReadUint(); err == nil {
-					_, err := w.Write([]byte(linkObj(addr)))
+	switch t := v.Type.(type) {
+	case *corefile.NumericType:
+		return writeField(v, fieldName, fmt.Sprintf("%v", v.ReadScalar()))
+
+	case *corefile.ArrayType:
+		for k := uint64(0); k < t.Len; k++ {
+			kname := fieldName + fmt.Sprintf("[%d]", k)
+			kv, err := v.Index(k)
+			if err != nil {
+				if err := writeField(kv, kname, "???"); err != nil {
+					return err
+				}
+			} else {
+				if err := fmtValue(kv, kname, writeField); err != nil {
 					return err
 				}
 			}
-			return heapdump.ErrUseDefaultFormatter
-		},
-		FieldMode: heapdump.FmtLongFieldNames,
-	})
-	if err != nil {
-		buf.WriteString(" ...")
+		}
+		return nil
+
+	case *corefile.PtrType:
+		if v.IsZero() {
+			return writeField(v, fieldName, "nil")
+		}
+		return writeField(v, fieldName, linkObj(v.ReadUint(), t.Elem))
+
+	case *corefile.InterfaceType:
+		if v.IsZero() {
+			return writeField(v, fieldName, "nil")
+		}
+		iv := v
+		iv.Type = v.Type.InternalRepresentation()
+		dataptr, err := iv.ReadUintFieldByName("data")
+		if err != nil {
+			log.Printf("error printing %s.$ifacedata 0x%x: %v", fieldName, v.Addr, err)
+			return writeField(v, fieldName, "???")
+		}
+		dt, err := v.DynamicType()
+		if err != nil {
+			log.Printf("error printing %s.$ifacetype 0x%x: %v", fieldName, v.Addr, err)
+			return writeField(v, fieldName, fmt.Sprintf("0x%x (unknown dynamic type)", dataptr))
+		}
+		// We link to the object with the deferenced type.
+		elemt := dt
+		if ptrt, ok := dt.(*corefile.PtrType); ok {
+			elemt = ptrt.Elem
+		}
+		return writeField(v, fieldName, linkObj(dataptr, elemt)+" "+dt.String())
+
+	case *corefile.StructType:
+		for _, f := range t.Fields {
+			fname := f.Name
+			if fname == "" {
+				fname = fmt.Sprintf("$offset_%d", f.Offset)
+			}
+			if fieldName != "" {
+				fname = fieldName + "." + fname
+			}
+			fv, err := v.Field(f)
+			if err != nil {
+				if err := writeField(fv, fname, "???"); err != nil {
+					return err
+				}
+			} else {
+				if err := fmtValue(fv, fname, writeField); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+
+	case *corefile.StringType:
+		if v.IsZero() {
+			return writeField(v, fieldName, "nil")
+		}
+		sv, err := v.DerefArray()
+		if err != nil {
+			return writeField(v, fieldName, "???")
+		}
+		return writeField(sv, fieldName, fmt.Sprintf("%q", sv.Bytes))
+
+	case *corefile.MapType:
+		return writeField(v, fieldName, "???") // TODO
+
+	case *corefile.FuncType:
+		return writeField(v, fieldName, "???") // TODO
+
+	case *corefile.GCObjectType:
+		return writeField(v, fieldName, "???") // TODO
+
+	default:
+		panic(fmt.Sprintf("unexpected type %s %T", t, t))
 	}
-	info.Value = buf.String()
-	return info
 }
 
 type mainInfo struct {
-	HasTypeInfo                                         bool
-	ByteOrder                                           string
-	Params                                              *heapdump.RawParams
-	HeapSize, HeapObjects, HeapRoots                    uint64
-	Goroutines, StackFrames                             uint64
-	GlobalRoots, LocalRoots, FinalizerRoots, OtherRoots uint64
-	MemStats                                            runtime.MemStats
-	AvgTotalPauseNs, AvgRecentPauseNs                   uint64
+	ByteOrder                         string
+	PointerSize                       uint64
+	GOARCH, GOOS                      string
+	MemStats                          runtime.MemStats
+	AvgTotalPauseNs, AvgRecentPauseNs uint64
 }
 
 var mainTemplate = template.Must(template.New("main").Parse(`
@@ -135,66 +271,24 @@ var mainTemplate = template.Must(template.New("main").Parse(`
 			padding-right: 20px;
 		}
 		</style>
-		<title>Heapdump Viewer</title>
+		<title>Coredump Viewer</title>
 		</head>
 	<body>
 	<code>
-		<h2>Heapdump Viewer</h2>
-		<a href="histograms">Histograms</a>
-		<a href="globals">Globals</a>
+		<h2>Coredump Viewer</h2>
+		<a href="packages">Globals</a>
 		<a href="goroutines?sort=status">Goroutines</a>
-		<a href="otherRoots">Finalizers and Other Roots</a>
-		{{if not .HasTypeInfo}}<br><br>Type information not available!{{end}}
 		<br><br>
 		Machine parameters:
 		<table>
 			<tr><td colspan="2">&nbsp;</td></tr>
 			<tr><td>ByteOrder = {{.ByteOrder}}</td></tr>
-			<tr><td>PointerSize = {{.Params.PtrSize}} bytes</td></tr>
-			<tr><td>NCPU = {{.Params.NCPU}}</td></tr>
-			<tr><td>GOARCH = '{{.Params.GoArch}}'</td></tr>
-			<tr><td>GOEXPERIMENT = '{{.Params.GoExperiment}}'</td></tr>
+			<tr><td>PointerSize = {{.PointerSize}} bytes</td></tr>
+			<tr><td>GOARCH = '{{.GOARCH}}'</td></tr>
+			<tr><td>GOOS = '{{.GOOS}}'</td></tr>
 		</table>
 		<br><br>
-		Heapdump stats:
-		<table>
-			<tr><td colspan="2">&nbsp;</td></tr>
-			<tr>
-				<td class="right">0x{{printf "%x" .Params.HeapStart}}</td>
-				<td>Address of the first byte of the heap region</td>
-			</tr>
-			<tr>
-				<td class="right">0x{{printf "%x" .Params.HeapEnd}}</td>
-				<td>Address of the end the heap region (just after the last byte)</td>
-			</tr>
-			<tr>
-				<td class="right">{{.HeapSize}}</td>
-				<td>Size of the heap region in bytes</td>
-			</tr>
-			<tr>
-				<td class="right">{{.HeapObjects}}</td>
-				<td>Number of heap objects</td>
-			</tr>
-			<tr>
-				<td class="right">{{.HeapRoots}}</td>
-				<td>Number of GC roots
-					({{.GlobalRoots}} globals,
-					{{.LocalRoots}} locals,
-					{{.FinalizerRoots}} from finalizers,
-					{{.OtherRoots}} other)
-				</td>
-			</tr>
-			<tr>
-				<td class="right">{{.Goroutines}}</td>
-				<td>Number of goroutines</td>
-			</tr>
-			<tr>
-				<td class="right">{{.StackFrames}}</td>
-				<td>Number of stack frames</td>
-			</tr>
-		</table>
-		<br>
-		<br>Full runtime.MemStats:
+		Full runtime.MemStats (FIXME: most of these are currently wrong):
 		<table>
 			<!-- Main stats -->
 			<tr><td colspan="2">&nbsp;</td></tr>
@@ -318,56 +412,78 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	info := mainInfo{
-		HasTypeInfo: dump.HasTypeInfo(),
-		Params:      dump.Raw.Params,
-		HeapSize:    dump.Raw.Params.HeapEnd - dump.Raw.Params.HeapStart,
-		HeapObjects: uint64(len(dump.HeapObjects)),
+		ByteOrder:   program.RuntimeLibrary.Arch.ByteOrder.String(),
+		PointerSize: uint64(program.RuntimeLibrary.Arch.PointerSize),
+		GOARCH:      program.RuntimeLibrary.GOARCH,
+		GOOS:        program.RuntimeLibrary.GOOS,
 	}
-	switch dump.Raw.Params.ByteOrder {
-	case binary.BigEndian:
-		info.ByteOrder = "big endian"
-	case binary.LittleEndian:
-		info.ByteOrder = "little endian"
-	default:
-		panic(fmt.Errorf("unknown byte order %#v", dump.Raw.Params.ByteOrder))
+
+	if memstats, ok := program.RuntimeLibrary.Vars.FindName("runtime.memstats"); !ok {
+		log.Printf("WARNING: could not find runtime.memstats")
+	} else {
+		readUintField := func(fieldname string) uint64 {
+			v, err := memstats.Value.ReadUintFieldByName(fieldname)
+			if err != nil {
+				log.Printf("WARNING: could read runtime.memstats.%s: %v", fieldname, err)
+			}
+			return v
+		}
+		// TODO: see runtime.updatememstats
+		info.MemStats.Alloc = readUintField("alloc")
+		info.MemStats.TotalAlloc = readUintField("total_alloc")
+		info.MemStats.Sys = readUintField("sys")
+		info.MemStats.Lookups = readUintField("nlookup")
+		info.MemStats.Mallocs = readUintField("nmalloc")
+		info.MemStats.Frees = readUintField("nfree")
+		info.MemStats.HeapAlloc = readUintField("heap_alloc")
+		info.MemStats.HeapSys = readUintField("heap_sys")
+		info.MemStats.HeapIdle = readUintField("heap_idle")
+		info.MemStats.HeapInuse = readUintField("heap_inuse")
+		info.MemStats.HeapReleased = readUintField("heap_released")
+		info.MemStats.HeapObjects = readUintField("heap_objects")
+		info.MemStats.StackInuse = readUintField("stacks_inuse")
+		info.MemStats.StackSys = readUintField("stacks_sys")
+		info.MemStats.MSpanInuse = readUintField("mspan_inuse")
+		info.MemStats.MSpanSys = readUintField("mspan_sys")
+		info.MemStats.MCacheInuse = readUintField("mcache_inuse")
+		info.MemStats.MCacheSys = readUintField("mcache_sys")
+		info.MemStats.BuckHashSys = readUintField("buckhash_sys")
+		info.MemStats.GCSys = readUintField("gc_sys")
+		info.MemStats.OtherSys = readUintField("other_sys")
+		info.MemStats.NextGC = readUintField("next_gc")
+		info.MemStats.PauseTotalNs = readUintField("pause_total_ns")
+		info.MemStats.NumGC = uint32(readUintField("numgc"))
+		if info.MemStats.NumGC > 0 {
+			info.AvgTotalPauseNs = info.MemStats.PauseTotalNs / uint64(info.MemStats.NumGC)
+		}
+		if pauseNs, err := memstats.Value.FieldByName("pause_ns"); err == nil {
+			var total, count uint64
+			for k := uint32(0); k < 256 && k < info.MemStats.NumGC; k++ {
+				idx := (info.MemStats.NumGC - k) % 256
+				v, err := pauseNs.Index(uint64(idx))
+				if err != nil {
+					log.Printf("WARNING: could read runtime.memstats.PauseNs[%d]: %v", idx, err)
+					continue
+				}
+				total += v.ReadUint()
+				count++
+			}
+			if count > 0 {
+				info.AvgRecentPauseNs = total / count
+			}
+		}
+		// See runtime.readmemstats_m.
+		info.MemStats.StackSys += info.MemStats.StackInuse
+		info.MemStats.HeapInuse -= info.MemStats.StackInuse
+		info.MemStats.HeapSys -= info.MemStats.StackInuse
 	}
-	for _, g := range dump.Goroutines {
-		info.Goroutines++
-		for sf := g.Stack; sf != nil; sf = sf.Caller {
-			info.StackFrames++
-		}
-	}
-	dump.ForeachRootVar(func(v *heapdump.RootVar) {
-		info.HeapRoots++
-		switch v.Kind {
-		case heapdump.RootVarGlobal:
-			info.GlobalRoots++
-		case heapdump.RootVarLocal, heapdump.RootVarFuncParameter:
-			info.LocalRoots++
-		case heapdump.RootVarFinalizer:
-			info.FinalizerRoots++
-		default:
-			info.OtherRoots++
-		}
-	})
-	if ms := dump.Raw.MemStats; ms != nil {
-		var total, count uint64
-		for k := uint32(0); k < 256 && k < ms.NumGC; k++ {
-			total += ms.PauseNs[(ms.NumGC-k)%256]
-			count++
-		}
-		info.MemStats = *ms
-		if count > 0 {
-			info.AvgRecentPauseNs = total / count
-			info.AvgTotalPauseNs = ms.PauseTotalNs / uint64(ms.NumGC)
-		}
-	}
+
 	if err := mainTemplate.Execute(w, info); err != nil {
 		log.Print(err)
 	}
 }
 
-var globalsTemplate = template.Must(template.New("globals").Parse(`
+var allPackagesTemplate = template.Must(template.New("allPackages").Parse(`
 <html>
 	<head>
 		<style>
@@ -378,11 +494,40 @@ var globalsTemplate = template.Must(template.New("globals").Parse(`
 			border:1px solid grey;
 		}
 		</style>
-		<title>Global Roots</title>
+		<title>Packages</title>
 	</head>
 	<body>
 	<code>
-		<h2>Global Roots</h2>
+		<h2>Imported Packages</h2>
+		{{range .}}
+		<br/><a href="packages?pkg={{.}}">{{.}}</a>
+		{{end}}
+	</code>
+	</body>
+</html>
+`))
+
+type packageInfo struct {
+	Name  string
+	Infos []varInfo
+}
+
+var packageTemplate = template.Must(template.New("package").Parse(`
+<html>
+	<head>
+		<style>
+		table {
+			border-collapse:collapse;
+		}
+		table, td, th {
+			border:1px solid grey;
+		}
+		</style>
+		<title>Package {{.Name}}</title>
+	</head>
+	<body>
+	<code>
+		<h2>Package {{.Name}}</h2>
 		<table>
 		<tr>
 			<td>Name</td>
@@ -390,7 +535,7 @@ var globalsTemplate = template.Must(template.New("globals").Parse(`
 			<td>Type</td>
 			<td>Value</td>
 		</tr>
-		{{range .}}
+		{{range .Infos}}
 		<tr>
 			<td>{{.Name}}</td>
 			<td>{{.Addr}}</td>
@@ -404,61 +549,36 @@ var globalsTemplate = template.Must(template.New("globals").Parse(`
 </html>
 `))
 
-func globalsHandler(w http.ResponseWriter, r *http.Request) {
-	var infos []varInfo
-	for _, gv := range dump.GlobalVars.List {
-		infos = append(infos, makeVarInfo(gv.Name, gv.Value))
+func packagesHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if len(q["pkg"]) == 0 {
+		// Show a list of packages with global vars.
+		pkgs := corefile.NewQuery(program.GlobalVars).
+			GroupBy(func(v corefile.Var) string { return v.PkgPath }).
+			Map(func(g corefile.QueryGrouping) string { return g.Key.(string) }).
+			RunAndReturnAll().([]string)
+		pkgs = append(pkgs, "runtime")
+		sort.Strings(pkgs)
+		if err := allPackagesTemplate.Execute(w, pkgs); err != nil {
+			log.Print(err)
+		}
+		return
 	}
-	if err := globalsTemplate.Execute(w, infos); err != nil {
-		log.Print(err)
+
+	// Show a list of all global variables in this package.
+	pkg := q["pkg"][0]
+	info := packageInfo{Name: pkg}
+	if pkg == "runtime" {
+		info.Infos = corefile.NewQuery(program.RuntimeLibrary.Vars).
+			Map(makeVarInfo).
+			RunAndReturnAll().([]varInfo)
+	} else {
+		info.Infos = corefile.NewQuery(program.GlobalVars).
+			Where(func(v corefile.Var) bool { return v.PkgPath == pkg }).
+			Map(makeVarInfo).
+			RunAndReturnAll().([]varInfo)
 	}
-}
-
-var otherRootsTemplate = template.Must(template.New("otherRoots").Parse(`
-<html>
-	<head>
-		<style>
-		table {
-			border-collapse:collapse;
-		}
-		table, td, th {
-			border:1px solid grey;
-		}
-		</style>
-		<title>Other Roots</title>
-	</head>
-	<body>
-	<code>
-		<h2>Other Roots</h2>
-		<table>
-		<tr>
-			<td>Name</td>
-			<td>Type</td>
-			<td>Value</td>
-		</tr>
-		{{range .}}
-		<tr>
-			<td>{{.Name}}</td>
-			<td>{{.Type}}</td>
-			<td>{{.Value}}</td>
-		</tr>
-		{{end}}
-		</table>
-	</code>
-	</body>
-</html>
-`))
-
-func otherRootsHandler(w http.ResponseWriter, r *http.Request) {
-	var infos []varInfo
-	dump.ForeachRootVar(func(rv *heapdump.RootVar) {
-		switch rv.Kind {
-		case heapdump.RootVarGlobal, heapdump.RootVarLocal, heapdump.RootVarFuncParameter:
-		default:
-			infos = append(infos, makeVarInfo(rv.Name, rv.Value))
-		}
-	})
-	if err := otherRootsTemplate.Execute(w, infos); err != nil {
+	if err := packageTemplate.Execute(w, info); err != nil {
 		log.Print(err)
 	}
 }
@@ -470,6 +590,7 @@ func otherRootsHandler(w http.ResponseWriter, r *http.Request) {
 // TODO: group by stack trace?
 type goroutineListInfo struct {
 	Goroutines []*goroutineInfo
+	IsRuntime  bool
 }
 
 type goroutineInfo struct {
@@ -484,10 +605,10 @@ func (a goroutineByStatus) Len() int           { return len(a) }
 func (a goroutineByStatus) Swap(i, k int)      { a[i], a[k] = a[k], a[i] }
 func (a goroutineByStatus) Less(i, k int) bool { return a[i].Status < a[k].Status }
 
-func makeGoroutineInfo(g *heapdump.Goroutine) *goroutineInfo {
+func makeGoroutineInfo(g *corefile.Goroutine) *goroutineInfo {
 	info := &goroutineInfo{
-		G:      linkObj(g.Raw.GAddr),
-		Status: g.Status(),
+		G:      linkValue(g.G),
+		Status: g.StatusString,
 	}
 	for sf := g.Stack; sf != nil; sf = sf.Caller {
 		info.Frames = append(info.Frames, makeFrameInfo(sf))
@@ -529,7 +650,7 @@ var goroutinesTemplate = template.Must(template.New("goroutines").Parse(`
 				</td>
 				<td align="left">
 					{{if .HavePos}}
-						{{.PCPos.File}}:{{.PCPos.Line}}
+						{{.File}}:{{.Line}}
 					{{end}}
 				</td>
 			</tr>
@@ -542,9 +663,16 @@ var goroutinesTemplate = template.Must(template.New("goroutines").Parse(`
 `))
 
 func goroutinesHandler(w http.ResponseWriter, r *http.Request) {
-	var info goroutineListInfo
-	for _, g := range dump.Goroutines {
-		info.Goroutines = append(info.Goroutines, makeGoroutineInfo(g))
+	isRuntime, _ := lookupParam(r.URL.Query(), "runtime", 10)
+	info := goroutineListInfo{IsRuntime: isRuntime > 0}
+	if info.IsRuntime {
+		for _, g := range program.RuntimeLibrary.Goroutines {
+			info.Goroutines = append(info.Goroutines, makeGoroutineInfo(g))
+		}
+	} else {
+		for _, g := range program.Goroutines {
+			info.Goroutines = append(info.Goroutines, makeGoroutineInfo(g))
+		}
 	}
 	sort.Sort(goroutineByStatus(info.Goroutines))
 	if err := goroutinesTemplate.Execute(w, info); err != nil {
@@ -556,41 +684,36 @@ func goroutinesHandler(w http.ResponseWriter, r *http.Request) {
 // TODO: links to frame objects are broken? links to a very large type?
 //  (might be linking to a heap object that the frame resides in, perhaps?)
 type frameInfo struct {
-	Addr             string               // address of the stack frame (as an obj link)
-	Size             uint64               // size of the stack frame
-	Depth            uint64               // depth in the goroutine (0 is the current stack)
-	PC, PCOffset     uint64               // current PC and PC-FuncEntry.Offset
-	Name, LinkedName string               // name of the function (linked name links to the frame's page)
-	HavePos          bool                 // true if PCPos != nil
-	PCPos            *heapdump.SymTabLine // if known
-	Caller, Callee   string               // links to caller/callee, if any
+	Depth            uint64 // depth in the goroutine (0 is the current stack)
+	PC, PCOffset     uint64 // current PC and PC-FuncEntry.Offset
+	Name, LinkedName string // name of the function (linked name links to the frame's page)
+	HavePos          bool   // true if File and Line are valid
+	File             string
+	Line             uint64
+	Caller, Callee   string // links to caller/callee, if any
 	Vars             []varInfo
-	Self             *frameInfo
 }
 
-func makeFrameInfo(sf *heapdump.StackFrame) *frameInfo {
-	info := frameInfo{
-		Size:  sf.Size(),
-		Depth: sf.Depth(),
-		PC:    sf.PC(),
+func makeFrameInfo(sf *corefile.StackFrame) *frameInfo {
+	info := &frameInfo{
+		PC:   sf.PC,
+		Vars: corefile.NewQuery(sf.LocalVars).Map(makeVarInfo).RunAndReturnAll().([]varInfo),
 	}
-	if sf.Size() == 0 {
-		info.Addr = fmt.Sprintf("0x%x", sf.Addr()) // frame is empty so there is no object to link to
+	for x := sf; x.Callee != nil; x = x.Callee {
+		info.Depth++
+	}
+	if sf.Func != nil {
+		info.PCOffset = sf.PC - sf.Func.EntryPC
+	}
+	pcinfo, err := program.PCInfo(sf.PC)
+	if err != nil {
+		log.Printf("could not find pcinfo for 0x%x: %v", sf.PC, err)
+		info.Name = "???"
 	} else {
-		info.Addr = linkObj(sf.Addr())
-	}
-
-	// Use symbol info to get the name and line info, if known.
-	if dump.HasTypeInfo() {
-		if pos := dump.LookupPC(sf.PC()); pos != nil {
-			info.Name = pos.Func.Name
-			info.PCOffset = sf.PC() - pos.Func.Entry
-			info.PCPos = pos
-			info.HavePos = true
-		}
-	}
-	if info.Name == "" {
-		info.Name = sf.Raw.Name
+		info.HavePos = true
+		info.File = pcinfo.File
+		info.Line = pcinfo.Line
+		info.Name = pcinfo.Func.Name
 	}
 	info.LinkedName = linkFrame(sf, info.Name)
 
@@ -604,12 +727,7 @@ func makeFrameInfo(sf *heapdump.StackFrame) *frameInfo {
 	} else {
 		info.Callee = "(No callee)"
 	}
-
-	for _, lv := range sf.LocalVars.List {
-		info.Vars = append(info.Vars, makeVarInfo(lv.Name, lv.Value))
-	}
-
-	return &info
+	return info
 }
 
 type frameAndGoroutineInfo struct {
@@ -638,7 +756,6 @@ var frameTemplate = template.Must(template.New("frame").Parse(`
 	<body>
 	<code>
 		<h2>Frame #{{.Self.Depth}}: {{.Self.Name}}</h2>
-		Frame is {{.Self.Size}} bytes starting from {{.Self.Addr}}.
 		{{.Self.Caller}} {{.Self.Callee}} <br>
 
 		<h3>Variables</h3>
@@ -683,7 +800,7 @@ var frameTemplate = template.Must(template.New("frame").Parse(`
 			</td>
 			<td class="noborder" align="left">
 				{{if .HavePos}}
-					{{.PCPos.File}}:{{.PCPos.Line}}
+					{{.File}}:{{.Line}}
 				{{end}}
 			</td>
 		</tr>
@@ -696,24 +813,29 @@ var frameTemplate = template.Must(template.New("frame").Parse(`
 
 func frameHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	addr, err := lookupParam(q, "id", 16)
+	gidx, err := lookupParam(q, "goroutine", 10)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		http.Error(w, "could not parse goroutine param", 400)
 		return
 	}
 	depth, err := lookupParam(q, "depth", 10)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		http.Error(w, "could not parse depth param", 400)
 		return
 	}
+	if gidx >= uint64(len(program.Goroutines)) {
+		http.Error(w, "bad goroutine param", 400)
+		return
+	}
+	g := program.Goroutines[gidx]
 
-	findStackFrame := func() *heapdump.StackFrame {
-		for _, g := range dump.Goroutines {
-			for sf := g.Stack; sf != nil; sf = sf.Caller {
-				if sf.Addr() == addr && sf.Depth() == depth {
-					return sf
-				}
+	findStackFrame := func() *corefile.StackFrame {
+		k := uint64(0)
+		for sf := g.Stack; sf != nil; sf = sf.Caller {
+			if k == depth {
+				return sf
 			}
+			k++
 		}
 		return nil
 	}
@@ -722,7 +844,8 @@ func frameHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stack frame not found", 404)
 		return
 	}
-	ginfo := makeGoroutineInfo(sf.Goroutine)
+
+	ginfo := makeGoroutineInfo(g)
 	info := &frameAndGoroutineInfo{
 		Goroutine: ginfo,
 		Self:      ginfo.Frames[depth],
@@ -742,18 +865,16 @@ func frameHandler(w http.ResponseWriter, r *http.Request) {
 //  - offset heap dominated by this object
 // TODO: when we have dwarf info, some ptrs (e.g., in stacks?) are PCs
 type objInfo struct {
-	Addr            string
-	Type            string
-	Offset          uint64
-	Size            uint64 // or estimate if unknown
-	BaseObj         string
-	BaseObjSize     uint64 // also the sizeof(obj) if Offset=0
-	ExtraInfo       string
-	IsUnknownType   bool
-	Fields          []varInfo
-	FieldsOverflow  string
-	InEdges         []varInfo
-	InEdgesOverflow string
+	Addr           string
+	Type           string
+	Size           uint64 // or estimate if unknown
+	BaseObj        string // if known
+	BaseObjSize    uint64 // if known
+	Offset         uint64 // offset within BaseObj, if known
+	ExtraInfo      string
+	IsGCObjectType bool
+	Fields         []varInfo
+	FieldsOverflow string
 }
 
 var objTemplate = template.Must(template.New("obj").Parse(`
@@ -767,14 +888,14 @@ var objTemplate = template.Must(template.New("obj").Parse(`
 			border:1px solid grey;
 		}
 		</style>
-		<title>Object {{.Addr}}</title>
+		<title>Object {{.Addr}} : {{.Type}}</title>
 	</head>
 	<body>
 	<code>
 		<h2>Object {{.Addr}} : {{.Type}}</h2>
 		{{if ne .Offset 0}}
 			Address {{.Addr}} is at offset {{.Offset}} of object {{.BaseObj}}, which is {{.BaseObjSize}} bytes.
-			{{if .IsUnknownType}}
+			{{if .IsGCObjectType}}
 				Field size is not known, but it as most {{.Size}} bytes.
 			{{else}}
 				Field is {{.Size}} bytes.
@@ -785,7 +906,7 @@ var objTemplate = template.Must(template.New("obj").Parse(`
 		{{.ExtraInfo}}
 
 		<h3>Fields</h3>
-		{{if .IsUnknownType}}
+		{{if .IsGCObjectType}}
 			Object type is not known. Showing pointer fields from the GC signature.<br><br>
 		{{end}}
 		<table>
@@ -805,12 +926,6 @@ var objTemplate = template.Must(template.New("obj").Parse(`
 			{{end}}
 		</table>
 		{{.FieldsOverflow}}
-
-		<h3>Pointers to this object</h3>
-		{{range .InEdges}}
-		{{.Addr}}<br>
-		{{end}}
-		{{.InEdgesOverflow}}
 	</code>
 	</body>
 </html>
@@ -820,7 +935,18 @@ func objHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	addr, err := lookupParam(q, "addr", 16)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		log.Print(err)
+		http.Error(w, "could not parse addr param", 400)
+		return
+	}
+	tid, err := lookupParam(q, "type", 10)
+	if err != nil {
+		http.Error(w, "could not parse type param", 400)
+		return
+	}
+	t := typeFromID[int(tid)]
+	if t == nil {
+		http.Error(w, "bad type param", 400)
 		return
 	}
 	const defaultMaxFields = 1024
@@ -828,78 +954,43 @@ func objHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		maxFields = defaultMaxFields
 	}
-	overflowText := fmt.Sprintf("... truncated to %d fields (click %s to show all; may be slow)",
-		maxFields,
-		fmt.Sprintf("<a href=obj?addr=%x,maxfields=%d>here</a>", addr, uint64(math.MaxUint64)))
 
-	// Lookup the object.
-	// For global/lock vars, rv will give extra info.
-	var v *heapdump.Value
-	rv := dump.FindStackOrGlobalObject(addr)
-	if rv != nil {
-		v = rv.Value
-	} else {
-		v = dump.FindHeapObject(addr)
-	}
-	if v == nil {
-		http.Error(w, "object not found", 404)
+	// Lookup the value.
+	v, err := program.Value(addr, t)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("could not load value from 0x%x with type %s", addr, t), 400)
 		return
 	}
 
 	// Basic info about the object.
 	info := objInfo{
-		Addr:   fmt.Sprintf("0x%x", addr),
-		Offset: addr - v.Addr(),
+		Addr: fmt.Sprintf("0x%x", addr),
+		Type: t.String(),
+		Size: v.Size(),
 	}
-	if info.Offset != 0 {
-		info.BaseObj = linkObj(v.Addr())
-		info.BaseObjSize = v.Size()
-		v, err = v.RawOffset(info.Offset)
-		if err != nil {
-			// NB: Should not fail since FindObject returns a value that contains addr..
-			panic(fmt.Errorf("RawOffset: %#v err=%v", info, err))
-		}
-		info.Size = v.Size()
-	} else {
-		info.Size = v.Size()
-	}
-	if rv != nil {
-		info.ExtraInfo = fmt.Sprintf("Object is a %s variable named \"%s\".", strings.ToLower(string(rv.Kind)), rv.Name)
-	}
-
-	// Type info.
-	info.Type = v.Type.String()
-	_, info.IsUnknownType = v.Type.(*heapdump.UnknownType)
+	_, info.IsGCObjectType = v.Type.(*corefile.GCObjectType)
 
 	// Enumerate all fields.
-	// TODO: high-level instead?
 	all := true
-	v.ForeachField(heapdump.LowLevelScalarTypes, func(name string, field *heapdump.Value) {
+	fmtValue(v, "", func(v corefile.Value, name, value string) error {
 		if uint64(len(info.Fields)) >= maxFields {
 			all = false
-			return
+			return nil
 		}
-		info.Fields = append(info.Fields, makeVarInfo(name, field))
+		if len(value) > 1000 {
+			value = value[:1000] + "..."
+		}
+		info.Fields = append(info.Fields, varInfo{
+			Name:  name,
+			Addr:  linkValue(v),
+			Type:  v.Type.String(),
+			Value: value,
+		})
+		return nil
 	})
 	if !all {
-		info.FieldsOverflow = overflowText
-	}
-
-	// For heap objects, enumerate all in edges.
-	if rv == nil {
-		all := true
-		obj, err := v.ContainingObject()
-		if err != nil {
-			panic(err) // shouldn't happen since v should be in the heap
-		}
-		for _, ptr := range dump.InEdges(obj) {
-			info.InEdges = append(info.InEdges, makeVarInfo("", ptr))
-		}
-		if !all {
-			info.InEdgesOverflow = overflowText
-		}
-	} else {
-		info.InEdgesOverflow = fmt.Sprintf("Not tracked for stack/global variables.")
+		info.FieldsOverflow = fmt.Sprintf("... truncated to %d fields (click %s to show all; may be slow)",
+			maxFields, fmt.Sprintf("<a href=obj?addr=%x,maxfields=%d>here</a>", addr, uint64(math.MaxUint64)))
 	}
 
 	if err := objTemplate.Execute(w, info); err != nil {
@@ -907,127 +998,32 @@ func objHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-type histogramInfo struct {
-	Title                                string
-	NameColumn, BytesColumn, CountColumn string
-	Entries                              []*histogramEntry
-}
-
-type histogramEntry struct {
-	Name  string
-	Bytes uint64
-	Count uint64
-}
-
-var histogramTemplate = template.Must(template.New("histogram").Parse(`
-<html>
-	<head>
-		<style>
-		table {
-			border-collapse:collapse;
-		}
-		table, td, th {
-			border:1px solid grey;
-		}
-		</style>
-		<title>{{.Title}}</title>
-		</head>
-	<body>
-	<code>
-		<h2>{{.Title}}</h2>
-		<table>
-			<tr>
-				<td align="right">{{.BytesColumn}}</td>
-				<td align="right">{{.CountColumn}}</td>
-				<td>{{.NameColumn}}</td>
-			</tr>
-			{{range .Entries}}
-			<tr>
-				<td align="right">{{.Bytes}}</td>
-				<td align="right">{{.Count}}</td>
-				<td>{{.Name}}</td>
-			</tr>
-			{{end}}
-		</table>
-	</code>
-	</body>
-</html>
-`))
-
-// TODO: build histograms of other properties?
-// TODO: option to sort-by-count?
-func histogramsHandler(w http.ResponseWriter, r *http.Request) {
-	info := histogramInfo{
-		Title:       "Types Histogram",
-		NameColumn:  "Type",
-		BytesColumn: "Total Bytes",
-		CountColumn: "Objects",
-	}
-	types := map[heapdump.Type]*histogramEntry{}
-
-	for k := range dump.HeapObjects {
-		v := &dump.HeapObjects[k]
-		if e := types[v.Type]; e != nil {
-			e.Bytes += v.Size()
-			e.Count++
-			continue
-		}
-		e := &histogramEntry{
-			Name:  v.Type.String(),
-			Bytes: v.Size(),
-			Count: 1,
-		}
-		info.Entries = append(info.Entries, e)
-		types[v.Type] = e
-	}
-
-	sort.Sort(sortEntryByBytes(info.Entries))
-	if err := histogramTemplate.Execute(w, info); err != nil {
-		log.Print(err)
-	}
-}
-
-type sortEntryByBytes []*histogramEntry
-
-func (a sortEntryByBytes) Len() int           { return len(a) }
-func (a sortEntryByBytes) Swap(i, k int)      { a[i], a[k] = a[k], a[i] }
-func (a sortEntryByBytes) Less(i, k int) bool { return a[i].Bytes > a[k].Bytes }
-
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: heapview heapdump [executable]\n")
 	flag.PrintDefaults()
 	os.Exit(2)
 }
 
-// TODO: Heap objects info
-// - list of referrers for each object
-
-// TODO: Dominator tree
-// - save dominated bytes for each object
-// - show as a dot/svg graph, perhaps with pruning
-// - allow groupBy, e.g., group by type
-
-// TODO: Expression evaluators
-// - evaluate arbitrary Go exprs?
-// - $pathsTo(obj) to compute paths from GC roots to obj
-// - $paths(src, obj) to compute paths from src to obj
-
 func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	if *verboseDebug {
-		heapdump.LogPrintf = log.Printf
+	if *debugLevel > 0 {
+		corefile.DebugLogf = func(verbosityLevel int, format string, args ...interface{}) {
+			if verbosityLevel <= *debugLevel {
+				log.Printf(format, args...)
+			}
+		}
 	}
 
-	var dumpname, execname string
+	var corename, execname string
 	args := flag.Args()
 	switch len(args) {
 	case 1:
-		dumpname = args[0]
+		corename = args[0]
 		execname = ""
 	case 2:
-		dumpname = args[0]
+		corename = args[0]
 		execname = args[1]
 	default:
 		usage()
@@ -1035,24 +1031,20 @@ func main() {
 
 	fmt.Println("Loading...")
 	var err error
-	dump, err = heapdump.Read(dumpname, execname, false)
+	program, err = corefile.OpenProgram(corename, &corefile.OpenProgramOptions{
+		ExecutablePath: execname,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println("Analyzing...")
-	dump.PrecomputeInEdges()
-
 	fmt.Printf("Ready. Point your browser to localhost:%d\n", *serverPort)
 	http.HandleFunc("/", mainHandler)
-	http.HandleFunc("/globals", globalsHandler)
+	http.HandleFunc("/packages", packagesHandler)
 	http.HandleFunc("/goroutines", goroutinesHandler)
 	http.HandleFunc("/frame", frameHandler)
 	http.HandleFunc("/obj", objHandler)
-	http.HandleFunc("/otherRoots", otherRootsHandler)
-	http.HandleFunc("/histograms", histogramsHandler)
-	//http.HandleFunc("/heapdump", heapdumpHandler) // XXX take heapdump of self
-	//http.HandleFunc("/type", typeHandler)
+	//http.HandleFunc("/histograms", histogramsHandler)
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", *serverPort), nil); err != nil {
 		log.Fatal(err)
 	}

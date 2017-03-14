@@ -1,4 +1,4 @@
-package heapdump
+package corefile
 
 import (
 	"errors"
@@ -10,8 +10,12 @@ import (
 
 var errMmapClosed = errors.New("mmap: closed")
 
-// mmapFile wraps a memory-mapped file.
+// mmapFile wraps a memory-mapped file. This is similar to
+// golang.org/x/exp/mmap.ReaderAt, but unlike mmap.ReaderAt,
+// mmapFile allows creating []byte slices that refer directly
+// to the underlying mmap'd memory segment.
 type mmapFile struct {
+	filename string
 	data     []byte
 	pos      uint64
 	writable bool
@@ -32,7 +36,7 @@ func mmapOpen(filename string, writable bool) (*mmapFile, error) {
 
 	size := st.Size()
 	if size == 0 {
-		return &mmapFile{data: []byte{}}, nil
+		return &mmapFile{filename: filename, data: []byte{}}, nil
 	}
 	if size < 0 {
 		return nil, fmt.Errorf("mmap: file %q has negative size: %d", filename, size)
@@ -49,7 +53,26 @@ func mmapOpen(filename string, writable bool) (*mmapFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &mmapFile{data: data, writable: writable}, nil
+	return &mmapFile{filename: filename, data: data, writable: writable}, nil
+}
+
+// mmapOpenAnonymous creates an anonymous mapping of the given size.
+// If writable is true, the mapping is created in writable mode.
+func mmapOpenAnonymous(size int, writable bool) (*mmapFile, error) {
+	prot := syscall.PROT_READ
+	if writable {
+		prot |= syscall.PROT_WRITE
+	}
+	data, err := syscall.Mmap(-1, 0, int(size), prot, syscall.MAP_ANONYMOUS|syscall.MAP_PRIVATE)
+	if err != nil {
+		return nil, err
+	}
+	return &mmapFile{filename: "", data: data, writable: writable}, nil
+}
+
+// Name returns the name of the file.
+func (f *mmapFile) Name() string {
+	return f.filename
 }
 
 // Size returns the size of the mapped file.
@@ -63,21 +86,25 @@ func (f *mmapFile) Pos() uint64 {
 	return f.pos
 }
 
-// SeekTo sets the current file pointer relative to the start of the file.
-func (f *mmapFile) SeekTo(offset uint64) {
-	f.pos = offset
-}
-
 // Read implements io.Reader.
 func (f *mmapFile) Read(p []byte) (int, error) {
+	n, err := f.ReadAt(p, int64(f.pos))
+	f.pos += uint64(n)
+	return n, err
+}
+
+// ReadAt implements io.ReaderAt.
+func (f *mmapFile) ReadAt(p []byte, offset int64) (int, error) {
 	if f.data == nil {
 		return 0, errMmapClosed
 	}
-	if f.pos >= f.Size() {
+	if offset < 0 {
+		return 0, fmt.Errorf("negative offset: %v", offset)
+	}
+	if uint64(offset) >= f.Size() {
 		return 0, io.EOF
 	}
-	n := copy(p, f.data[f.pos:])
-	f.pos += uint64(n)
+	n := copy(p, f.data[offset:])
 	if n < len(p) {
 		return n, io.EOF
 	}
@@ -99,7 +126,7 @@ func (f *mmapFile) ReadByte() (byte, error) {
 
 // ReadSlice returns a slice of size n that points directly at the
 // underlying mapped file. There is no copying. Fails if it cannot
-// read at least n bytes.
+// read n bytes from the current offset.
 func (f *mmapFile) ReadSlice(n uint64) ([]byte, error) {
 	if f.data == nil {
 		return nil, errMmapClosed
@@ -118,11 +145,8 @@ func (f *mmapFile) ReadSliceAt(offset, n uint64) ([]byte, error) {
 	if f.data == nil {
 		return nil, errMmapClosed
 	}
-	if f.Size() < offset {
-		return nil, fmt.Errorf("mmap: out-of-bounds ReadSliceAt offset %d, size is %d", offset, f.Size())
-	}
-	if offset+n >= f.Size() {
-		return nil, io.EOF
+	if offset+n > f.Size() {
+		return nil, fmt.Errorf("mmap: out-of-bounds ReadSliceAt(%d, %d), file size is %d", offset, n, f.Size())
 	}
 	end := offset + n
 	return f.data[offset:end:end], nil
@@ -134,7 +158,6 @@ func (f *mmapFile) Close() error {
 		return nil
 	}
 	err := syscall.Munmap(f.data)
-	f.data = nil
-	f.pos = 0
+	*f = mmapFile{}
 	return err
 }

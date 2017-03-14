@@ -7,7 +7,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 
-	heapdump "github.com/tombergan/goheapdump"
+	"github.com/tombergan/goheapdump/corefile"
 )
 
 /*
@@ -52,10 +52,10 @@ TODO: Ideas for checkers:
 
 */
 
-var verboseDebug = flag.Bool("debug", false, "Print verbose debugging info")
+var debugLevel = flag.Int("debuglevel", 0, "debug verbosity level")
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage: heapchecker heapdump executable\n")
+	fmt.Fprintf(os.Stderr, "usage: heapchecker corefile executable\n")
 	flag.PrintDefaults()
 	os.Exit(2)
 }
@@ -64,60 +64,45 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	if *verboseDebug {
-		heapdump.LogPrintf = log.Printf
+	if *debugLevel > 0 {
+		corefile.DebugLogf = func(verbosityLevel int, format string, args ...interface{}) {
+			if verbosityLevel <= *debugLevel {
+				log.Printf(format, args...)
+			}
+		}
 	}
 	if len(flag.Args()) != 2 {
 		usage()
 	}
-	dumpname := flag.Arg(0)
+	corename := flag.Arg(0)
 	execname := flag.Arg(1)
 
 	fmt.Println("Loading...")
-	dump, err := heapdump.Read(dumpname, execname, false)
+	program, err := corefile.OpenProgram(corename, &corefile.OpenProgramOptions{
+		ExecutablePath: execname,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	fmt.Println("Analyzing...")
-	dump.PrecomputeInEdges()
+	defer program.Close()
 
 	// TODO: This is a trivial example for demonstration.
-	for k := range dump.HeapObjects {
-		v := &dump.HeapObjects[k]
-		t, isstruct := v.Type.(*heapdump.StructType)
-		if !isstruct || t.String() != "net/http.body" {
-			continue
-		}
-		f := t.FieldByName("closed")
-		if f == nil {
-			fmt.Printf("Error: couldn't find field net/http.body.closed\n")
-			continue
-		}
-		fv, err := v.Field(f)
-		if err != nil {
-			fmt.Printf("Error extracting net/http.body.closed: %v\n", err)
-			continue
-		}
-		closed, err := fv.ReadUint()
-		if err != nil {
-			fmt.Printf("Error reading net/http.body.closed: %v\n", err)
-			continue
-		}
-		if closed == 0 {
-			fmt.Printf("\nFound open http.Response.Body at 0x%x\n", v.Addr())
-		} else {
-			// uncomment to see traces of closed bodies
-			//fmt.Printf("\nFound closed http.Response.Body at 0x%x\n", v.Addr())
-			continue
-		}
-		roots := dump.FindRootsFor(v)
-		if len(roots) == 0 {
-			fmt.Printf("... not reachable\n")
-		} else {
-			for _, rv := range roots {
-				fmt.Printf("... reachable from %s (%s)\n", rv.Name, rv.Kind)
-			}
-		}
+	// TODO: Would be more useful to show paths to the open bodies.
+	httpBodyType := program.FindType("net/http.body")
+	if httpBodyType == nil {
+		log.Fatal("could not find net/http.body")
 	}
+	corefile.NewQuery(program).
+		ReachableValues().
+		Where(func(v corefile.Value) bool {
+			// Look for values of type net/http.body that have closed=false.
+			if v.Type != httpBodyType {
+				return false
+			}
+			closed, err := v.ReadScalarFieldByName("closed")
+			return err == nil && !closed.(bool)
+		}).
+		Run(func(v corefile.Value) {
+			log.Printf("found open net/http.body at 0x%x", v.Addr)
+		})
 }
