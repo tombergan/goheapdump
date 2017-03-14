@@ -28,31 +28,30 @@ func roundUp(x, align uint64) uint64 {
 	return align * ((x + align - 1) / align)
 }
 
-// bitvector has one bit for each pointer-aligned word in a Program's
-// virtual memory space.
+// programBitvector has one bit for each pointer-aligned word in a
+// Program's virtual memory space.
 //
 // TODO: support very large heaps
 // TODO: support concurrent updates
-type bitvector struct {
-	chunks  []bitvectorChunk
+type programBitvector struct {
+	chunks  []programBitvectorChunk
 	ptrSize uint64 // in bytes
 }
 
-// XXX revisit uint64
-type bitvectorChunk struct {
-	addr uint64 // must be pointer-aligned
-	size uint64 // size in bytes
-	bits []uint64
+type programBitvectorChunk struct {
+	addr uint64   // must be pointer-aligned
+	size uint64   // size in bytes
+	bits []uint64 // bits is uint64 instead of uint8 so eventually we can atomic CAS
 }
 
-func newBitvector(p *Program) *bitvector {
-	bv := &bitvector{
+func newProgramBitvector(p *Program) *programBitvector {
+	bv := &programBitvector{
 		ptrSize: uint64(p.RuntimeLibrary.Arch.PointerSize),
 	}
 	for _, s := range p.dataSegments {
 		start := roundDown(s.addr, bv.ptrSize)
 		end := roundUp(s.addr+s.size(), bv.ptrSize)
-		chunk := bitvectorChunk{
+		chunk := programBitvectorChunk{
 			addr: start,
 			size: end - start,
 			bits: make([]uint64, (end-start)/bv.ptrSize/8),
@@ -64,7 +63,7 @@ func newBitvector(p *Program) *bitvector {
 
 // acquireRange sets all bits in the range [addr, addr+size) to 1, then
 // reports whether any of the bits were previously 0.
-func (bv *bitvector) acquireRange(addr, size uint64) bool {
+func (bv *programBitvector) acquireRange(addr, size uint64) bool {
 	if size == 0 {
 		return false
 	}
@@ -87,7 +86,7 @@ func (bv *bitvector) acquireRange(addr, size uint64) bool {
 	return changed
 }
 
-func (chunk *bitvectorChunk) acquireRange(addrStart, size, ptrSize uint64) bool {
+func (chunk *programBitvectorChunk) acquireRange(addrStart, size, ptrSize uint64) bool {
 	addrStart = max(addrStart, chunk.addr)
 	addrEnd := min(addrStart+size, chunk.addr+chunk.size)
 

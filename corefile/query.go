@@ -973,7 +973,7 @@ func (n *queryGroupByNode) processEOF() {
 type queryGraphReachabilityNode struct {
 	queryNodeCommon
 	program *Program
-	visited *bitvector
+	visited *programBitvector
 }
 
 // TODO: exit early if all of our succs start skipping input
@@ -982,7 +982,7 @@ func (n *queryGraphReachabilityNode) processInput(input interface{}) {
 
 	if n.program == nil {
 		n.program = v.Type.Program()
-		n.visited = newBitvector(n.program)
+		n.visited = newProgramBitvector(n.program)
 	} else if v.Type.Program() != n.program {
 		panic("ReachableValues query cannot operate over values from different programs")
 	}

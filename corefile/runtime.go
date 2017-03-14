@@ -368,7 +368,7 @@ func (init *runtimeInitializer) loadImportantTypes() error {
 				{Name: "elem", Offset: 8, Type: p.MakePtrType(rt.typeType)},
 				{Name: "slice", Offset: 16, Type: p.MakePtrType(rt.typeType)},
 				{Name: "len", Offset: 24, Type: p.MakeNumericType(NumericUint64)},
-			})
+			}, 0)
 			rt.arraytypeLenField = rt.arraytypeType.(*StructType).Fields[3]
 			rt.arraytypeElemField = rt.arraytypeType.(*StructType).Fields[1]
 		}
@@ -476,7 +476,7 @@ func (init *runtimeInitializer) loadImportantTypes() error {
 		rt.findfuncbucketType = p.MakeStructType([]StructField{
 			{Name: "idx", Offset: 0, Type: p.MakeNumericType(NumericUint32)},
 			{Name: "subbuckets", Offset: 4, Type: p.MakeArrayType(p.MakeNumericType(NumericUint32), 16)},
-		})
+		}, 0)
 	}
 	if err := loadPtrToStruct("runtime.stackmap", &rt.ptrToStackmapType); err != nil {
 		return err

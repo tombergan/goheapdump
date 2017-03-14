@@ -1169,73 +1169,64 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 		return nil, err
 	}
 
-	makeNumeric := func(k NumericKind) (Type, error) {
-		t := tc.anonCache[[2]interface{}{"NumericType", k}]
-		if t == nil {
-			t = &NumericType{}
-			t.(*NumericType).initialize(tc, "", k)
-		}
-		return t, nil
-	}
-
 	switch kind & rttKindMask {
 	case rttKindBool:
-		return makeNumeric(NumericBool)
+		return tc.program.MakeNumericType(NumericBool), nil
 
 	case rttKindInt:
 		switch rt.Arch.IntSize {
 		case 4:
-			return makeNumeric(NumericInt32)
+			return tc.program.MakeNumericType(NumericInt32), nil
 		case 8:
-			return makeNumeric(NumericInt64)
+			return tc.program.MakeNumericType(NumericInt64), nil
 		default:
 			panic(fmt.Sprintf("unexpected Arch.IntSize: %d", rt.Arch.IntSize))
 		}
 	case rttKindInt8:
-		return makeNumeric(NumericInt8)
+		return tc.program.MakeNumericType(NumericInt8), nil
 	case rttKindInt16:
-		return makeNumeric(NumericInt16)
+		return tc.program.MakeNumericType(NumericInt16), nil
 	case rttKindInt32:
-		return makeNumeric(NumericInt32)
+		return tc.program.MakeNumericType(NumericInt32), nil
 	case rttKindInt64:
-		return makeNumeric(NumericInt64)
+		return tc.program.MakeNumericType(NumericInt64), nil
 
 	case rttKindUint:
 		switch rt.Arch.IntSize {
 		case 4:
-			return makeNumeric(NumericUint32)
+			return tc.program.MakeNumericType(NumericUint32), nil
 		case 8:
-			return makeNumeric(NumericUint64)
+			return tc.program.MakeNumericType(NumericUint64), nil
 		default:
 			panic(fmt.Sprintf("unexpected Arch.IntSize: %d", rt.Arch.IntSize))
 		}
 	case rttKindUint8:
-		return makeNumeric(NumericUint8)
+		return tc.program.MakeNumericType(NumericUint8), nil
 	case rttKindUint16:
-		return makeNumeric(NumericUint16)
+		return tc.program.MakeNumericType(NumericUint16), nil
 	case rttKindUint32:
-		return makeNumeric(NumericUint32)
+		return tc.program.MakeNumericType(NumericUint32), nil
 	case rttKindUint64:
-		return makeNumeric(NumericUint64)
+		return tc.program.MakeNumericType(NumericUint64), nil
 
 	case rttKindUintptr:
 		switch rt.Arch.PointerSize {
 		case 4:
-			return makeNumeric(NumericUint32)
+			return tc.program.MakeNumericType(NumericUint32), nil
 		case 8:
-			return makeNumeric(NumericUint64)
+			return tc.program.MakeNumericType(NumericUint64), nil
 		default:
 			panic(fmt.Sprintf("unexpected Arch.PointerSize: %d", rt.Arch.PointerSize))
 		}
 
 	case rttKindFloat32:
-		return makeNumeric(NumericFloat32)
+		return tc.program.MakeNumericType(NumericFloat32), nil
 	case rttKindFloat64:
-		return makeNumeric(NumericFloat64)
+		return tc.program.MakeNumericType(NumericFloat64), nil
 	case rttKindComplex64:
-		return makeNumeric(NumericComplex64)
+		return tc.program.MakeNumericType(NumericComplex64), nil
 	case rttKindComplex128:
-		return makeNumeric(NumericComplex128)
+		return tc.program.MakeNumericType(NumericComplex128), nil
 
 	case rttKindArray:
 		tdesc, err = tc.program.Value(tdesc.Addr, rt.arraytypeType)
@@ -1254,12 +1245,7 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 		if err != nil {
 			return nil, err
 		}
-		t := tc.anonCache[[3]interface{}{"ArrayType", elem, count}]
-		if t == nil {
-			t = new(ArrayType)
-			t.(*ArrayType).initialize(tc, "", elem, count)
-		}
-		return t, nil
+		return tc.program.MakeArrayType(elem, count), nil
 
 	case rttKindPtr:
 		tdesc, err = tc.program.Value(tdesc.Addr, rt.ptrtypeType)
@@ -1274,12 +1260,7 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 		if err != nil {
 			return nil, err
 		}
-		t := tc.anonCache[[2]interface{}{"PtrType", elem}]
-		if t == nil {
-			t = new(PtrType)
-			t.(*PtrType).initialize(tc, "", elem)
-		}
-		return t, nil
+		return tc.program.MakePtrType(elem), nil
 
 	case rttKindStruct:
 		size, err := tdesc.ReadUintField(tc.program.RuntimeLibrary.typeSizeField)
@@ -1336,15 +1317,13 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 				Offset: offset,
 			})
 		}
-		t := new(StructType)
-		t.initialize(tc, "", outfields, size)
-		return t, nil
+		return tc.program.MakeStructType(outfields, size), nil
 
 	case rttKindInterface:
-		// Unnamed interface type must be interface{}. Go programs can write
-		// unnamed types like "interface { Foo() bool }", however those types
-		// always are given a fake "name" so they can always be resolved by a
-		// name lookup. TODO: I don't think this works
+		// All interface types are named internally, even interface types
+		// that are anonymous in the original Go source code.
+		// TODO: We should actually print the type as a string then lookup
+		// that string as the "named" type.
 		t := tc.program.FindType("interface {}")
 		if t == nil {
 			return nil, errors.New("could not find type interface {}")
@@ -1364,12 +1343,7 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 		if err != nil {
 			return nil, err
 		}
-		t := tc.anonCache[[2]interface{}{"SliceType", elem}]
-		if t == nil {
-			t = new(SliceType)
-			t.(*SliceType).initialize(tc, "", elem, rt.sliceRepType)
-		}
-		return t, nil
+		return tc.program.MakeSliceType(elem), nil
 
 	case rttKindString:
 		panic("type unnamed string type should be cached")
@@ -1391,12 +1365,7 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 		if err != nil {
 			return nil, err
 		}
-		t := tc.anonCache[[3]interface{}{"ChanType", dir, elem}]
-		if t == nil {
-			t = new(ChanType)
-			t.(*ChanType).initialize(tc, "", reflect.ChanDir(dir), elem, rt.chanRepType)
-		}
-		return t, nil
+		return tc.program.MakeChanType(reflect.ChanDir(dir), elem), nil
 
 	case rttKindMap:
 		tdesc, err = tc.program.Value(tdesc.Addr, rt.maptypeType)
@@ -1419,12 +1388,7 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 		if err != nil {
 			return nil, err
 		}
-		t := tc.anonCache[[3]interface{}{"MapType", key, elem}]
-		if t == nil {
-			t = new(MapType)
-			t.(*MapType).initialize(tc, "", key, elem, rt.mapRepType)
-		}
-		return t, nil
+		return tc.program.MakeMapType(key, elem), nil
 
 	case rttKindFunc:
 		t := tc.anonCache[[1]interface{}{"FuncType"}]
@@ -1484,11 +1448,13 @@ func (p *Program) MakePtrType(elem Type) *PtrType {
 }
 
 // MakeStructType contructs an unnamed struct type.
-func (p *Program) MakeStructType(fields []StructField) *StructType {
-	var size uint64
-	for _, f := range fields {
-		if end := f.Offset + f.Type.Size(); end > size {
-			size = end
+// If size==0, it is inferred automatically from fields (if any).
+func (p *Program) MakeStructType(fields []StructField, size uint64) *StructType {
+	if size == 0 {
+		for _, f := range fields {
+			if end := f.Offset + f.Type.Size(); end > size {
+				size = end
+			}
 		}
 	}
 	sort.Sort(sortFieldByOffset(fields))

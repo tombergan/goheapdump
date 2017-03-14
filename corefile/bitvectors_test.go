@@ -7,7 +7,7 @@ import (
 	"golang.org/x/debug/arch"
 )
 
-func TestBitvector(t *testing.T) {
+func TestProgramBitvector(t *testing.T) {
 	p := &Program{
 		RuntimeLibrary: &RuntimeLibrary{
 			Arch: arch.Architecture{PointerSize: 4},
@@ -18,7 +18,7 @@ func TestBitvector(t *testing.T) {
 			dataSegment{addr: 300, data: make([]byte, 64)},
 		},
 	}
-	bv := newBitvector(p)
+	bv := newProgramBitvector(p)
 
 	tests := []struct {
 		addr, size uint64
