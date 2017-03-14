@@ -914,17 +914,17 @@ func (tc *typeCache) convertRuntimeItab(itabptr Value) (Type, error) {
 	defer func() { tc.depth-- }()
 	tc.verbosef("convert runtime itab (0x%x, %s)", itab.Addr, itab.Type)
 
-	tptr, err := itab.Field(tc.program.RuntimeLibrary.itabTypeField)
+	tdescPtr, err := itab.Field(tc.program.RuntimeLibrary.itabTypeField)
 	if err != nil {
 		return nil, err
 	}
-	return tc.convertRuntimeType(tptr)
+	return tc.convertRuntimeType(tdescPtr)
 }
 
 // convertRuntimeType builds a Type that represents the type described by the given
 // runtime type descriptor (e.g., a *runtime._type).
-func (tc *typeCache) convertRuntimeType(tptr Value) (Type, error) {
-	tdesc, err := tptr.Deref()
+func (tc *typeCache) convertRuntimeType(tdescPtr Value) (Type, error) {
+	tdesc, err := tdescPtr.Deref()
 	if err != nil {
 		return nil, err
 	}
@@ -962,7 +962,7 @@ func (tc *typeCache) convertRuntimeType(tptr Value) (Type, error) {
 				return nil, fmt.Errorf("could not find runtime type %q", fullname)
 			}
 		} else {
-			t, err = tc.convertUnnamedRuntimeType(tdesc)
+			t, err = tc.convertUnnamedRuntimeType(tdesc, tflag)
 			if err != nil {
 				return nil, err
 			}
@@ -1054,6 +1054,23 @@ func (tc *typeCache) runtimeTypeName(tdesc Value) (string, error) {
 	return str, nil
 }
 
+// implements reflect.rtype.String().
+func (tc *typeCache) runtimeTypeString(tdesc Value, tflag uint64) (string, error) {
+	strfield, err := tdesc.ReadUintField(tc.program.RuntimeLibrary.typeStrField)
+	if err != nil {
+		return "", err
+	}
+	str, err := tc.runtimeResolveNameOff(tdesc.Addr, strfield)
+	if err != nil {
+		return "", err
+	}
+	const tflagExtraStar = 1 << 1
+	if tflag&tflagExtraStar != 0 {
+		return str[1:], nil
+	}
+	return str, nil
+}
+
 // implements reflect.rtype.PkgPath().
 func (tc *typeCache) runtimeTypePkgPath(tdesc Value, tflag uint64) (string, error) {
 	rt := tc.program.RuntimeLibrary
@@ -1104,12 +1121,12 @@ func (tc *typeCache) runtimeTypePkgPath(tdesc Value, tflag uint64) (string, erro
 }
 
 // implements runtime.resolveNameOff() + runtime.name.name().
-func (tc *typeCache) runtimeResolveNameOff(tptr, off uint64) (string, error) {
+func (tc *typeCache) runtimeResolveNameOff(tdescAddr, off uint64) (string, error) {
 	if off == 0 {
 		return "", nil
 	}
 	for _, md := range tc.program.RuntimeLibrary.moduledatas {
-		if !md.types.contains(tptr) {
+		if !md.types.contains(tdescAddr) {
 			continue
 		}
 		s, ok := md.types.suffix(md.types.addr + off)
@@ -1125,7 +1142,7 @@ func (tc *typeCache) runtimeResolveNameOff(tptr, off uint64) (string, error) {
 
 	// Not in static data, so it should be a runtime name.
 	printf("TODO: runtime names not implemented")
-	return fmt.Sprintf("<unknown_type_name_%x_%x>", tptr, off), nil
+	return fmt.Sprintf("<unknown_type_name_%x_%x>", tdescAddr, off), nil
 	/*
 		res, found := reflectOffs.m[int32(off)]
 		if !found {
@@ -1161,7 +1178,7 @@ func (tc *typeCache) runtimeName(s dataSegment, dataAddr uint64) (string, error)
 	return string(str.data), nil
 }
 
-func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
+func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value, tflag uint64) (Type, error) {
 	rt := tc.program.RuntimeLibrary
 
 	kind, err := tdesc.ReadUintField(rt.typeKindField)
@@ -1321,12 +1338,16 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value) (Type, error) {
 
 	case rttKindInterface:
 		// All interface types are named internally, even interface types
-		// that are anonymous in the original Go source code.
-		// TODO: We should actually print the type as a string then lookup
-		// that string as the "named" type.
-		t := tc.program.FindType("interface {}")
+		// that are anonymous in the original Go source code. For anonymous
+		// interfaces the "name" is equivalent to reflect.Type.String().
+		name, err := tc.runtimeTypeString(tdesc, tflag)
+		if err != nil {
+			return nil, err
+		}
+		tc.verbosef("lookup interface type %s", name)
+		t := tc.program.FindType(name)
 		if t == nil {
-			return nil, errors.New("could not find type interface {}")
+			return nil, fmt.Errorf("could not find interface type %s", name)
 		}
 		return t, nil
 
