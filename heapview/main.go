@@ -156,6 +156,10 @@ func fmtValue(v corefile.Value, fieldName string, writeField func(v corefile.Val
 		return writeField(v, fieldName, fmt.Sprintf("%v", v.ReadScalar()))
 
 	case *corefile.ArrayType:
+		if et, isnum := t.Elem.(*corefile.NumericType); isnum && et.Kind == corefile.NumericUint8 {
+			// Special case for []byte.
+			return writeField(v, fieldName, fmt.Sprintf("%q", v.Bytes))
+		}
 		for k := uint64(0); k < t.Len; k++ {
 			kname := fieldName + fmt.Sprintf("[%d]", k)
 			kv, err := v.Index(k)
@@ -176,6 +180,13 @@ func fmtValue(v corefile.Value, fieldName string, writeField func(v corefile.Val
 			return writeField(v, fieldName, "nil")
 		}
 		return writeField(v, fieldName, linkObj(v.ReadUint(), t.Elem))
+
+	case *corefile.UnsafePtrType:
+		if v.IsZero() {
+			return writeField(v, fieldName, "nil")
+		}
+		// TODO: type?
+		return writeField(v, fieldName, fmt.Sprintf("0x%x", v.ReadUint()))
 
 	case *corefile.InterfaceType:
 		if v.IsZero() {
