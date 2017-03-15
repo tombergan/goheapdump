@@ -996,6 +996,7 @@ func (n *queryGraphReachabilityNode) processInput(input interface{}) {
 	n.visitValue(v)
 }
 
+// TODO: decide how to handle unsafe.Pointer (UnsafePtrType) when walking the typed heap
 func (n *queryGraphReachabilityNode) visitValue(v Value) {
 	if !v.Type.containsPointers() {
 		return
@@ -1024,6 +1025,9 @@ func (n *queryGraphReachabilityNode) visitValue(v Value) {
 		if x, err := v.Deref(); err == nil {
 			n.processInput(x)
 		}
+
+	case *UnsafePtrType:
+		// TODO
 
 	case *InterfaceType:
 		if x, err := v.Deref(); err == nil {

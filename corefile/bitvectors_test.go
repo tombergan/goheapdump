@@ -7,6 +7,33 @@ import (
 	"golang.org/x/debug/arch"
 )
 
+func TestRoundUpDown(t *testing.T) {
+	const ptrSize = 8
+	tests := []struct {
+		n        uint64
+		wantDown uint64
+		wantUp   uint64
+	}{
+		{0, 0, 0},
+		{1, 0, 8},
+		{4, 0, 8},
+		{7, 0, 8},
+		{8, 8, 8},
+		{9, 8, 16},
+		{15, 8, 16},
+		{16, 16, 16},
+	}
+
+	for _, test := range tests {
+		if got := roundUp(test.n, ptrSize); got != test.wantUp {
+			t.Errorf("roundUp(%v, %v)=%v, want %v", test.n, ptrSize, got, test.wantUp)
+		}
+		if got := roundDown(test.n, ptrSize); got != test.wantDown {
+			t.Errorf("roundDown(%v, %v)=%v, want %v", test.n, ptrSize, got, test.wantDown)
+		}
+	}
+}
+
 func TestProgramBitvector(t *testing.T) {
 	p := &Program{
 		RuntimeLibrary: &RuntimeLibrary{

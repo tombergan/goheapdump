@@ -108,7 +108,8 @@ func (chunk *programBitvectorChunk) acquireRange(addrStart, size, ptrSize uint64
 }
 
 // gcBitvector is an immutable bitvector that represents a GC bitmap
-// loaded from the core file.
+// loaded from the core file. gcBitmap covers bitmaps for global and
+// stack data. For heap data, use gcHeapBitvector.
 type gcBitvector struct {
 	bits    []byte
 	nbits   uint64
@@ -120,36 +121,46 @@ var gcEmptyBitvector = &gcBitvector{
 	bits: make([]byte, 0),
 }
 
-func newGCBitvector(p *Program, seg dataSegment, bitsAddr, nbits uint64) (*gcBitvector, error) {
+func newGCBitvector(p *Program, seg dataSegment, bits []byte, nbits uint64) *gcBitvector {
 	ptrSize := uint64(p.RuntimeLibrary.Arch.PointerSize)
-	size := (nbits + 7) / 8
-	if sanityChecks && size > seg.size() {
+	// Sanity checks.
+	if size := (nbits + 7) / 8; size > seg.size() {
 		panic(fmt.Sprintf("nbits=%d, size=%d, seg.size=%d", nbits, size, seg))
 	}
 	if seg.addr%ptrSize != 0 {
 		panic(fmt.Sprintf("seg.addr=0x%x not aligned to ptrSize=%d", seg.addr, ptrSize))
 	}
-	bits, ok := p.dataSegments.slice(bitsAddr, size)
-	if !ok {
-		return nil, fmt.Errorf("error loading bitvector at 0x%x (nbits=%d, size=%d)", bitsAddr, nbits, size)
-	}
 	return &gcBitvector{
-		bits:    bits.data,
+		bits:    bits,
 		nbits:   nbits,
 		seg:     seg,
 		ptrSize: ptrSize,
-	}, nil
+	}
 }
 
-// has reports whether addr contains a pointer.
+// contains reports whether bv covers the given address.
+func (bv *gcBitvector) contains(addr uint64) bool {
+	return bv.seg.contains(addr)
+}
+
+// isPointer reports whether addr contains a pointer.
 // Returns false if addr is outside the range of this bitvector.
-func (bv *gcBitvector) has(addr uint64) bool {
+func (bv *gcBitvector) isPointer(addr uint64) bool {
 	bit := (addr - bv.seg.addr) / bv.ptrSize
 	if bit >= bv.nbits {
 		return false
 	}
-	mask := uint8(1) << (bit % 8)
-	return uint8(bv.bits[bit/8])&mask != 0
+	return ((uint8(bv.bits[bit/8]) >> (bit % 8)) & 1) != 0
+}
+
+// foreachPointer calls fn for each pointer in the range [addr, addr+size).
+// addr must be pointer-aligned.
+func (bv *gcBitvector) foreachPointer(addr, size uint64, fn func(ptrValue uint64)) {
+	for end := addr + size; addr < end; addr += bv.ptrSize {
+		if bv.isPointer(addr) {
+			fn(addr)
+		}
+	}
 }
 
 // isStackVarLive checks the given type against the GC bitmap.
@@ -161,7 +172,7 @@ func (bv *gcBitvector) has(addr uint64) bool {
 //      There is a type-mismatch failure and a likely bug.
 //
 func (bv *gcBitvector) isStackVarLive(addr uint64, t Type) (bool, error) {
-	ptrsHave, ptrsMissing, err := bv.analyzeType(addr, t)
+	ptrsHave, ptrsMissing, err := compareGCBitvectorAndType(addr, bv.ptrSize, t, bv.isPointer)
 	if err != nil {
 		return false, err
 	}
@@ -177,7 +188,7 @@ func (bv *gcBitvector) isStackVarLive(addr uint64, t Type) (bool, error) {
 // checkPreciseType checks if a type at the given address has exactly the
 // pointers described by bv. Returns an error if not.
 func (bv *gcBitvector) checkPreciseType(addr uint64, t Type) error {
-	ptrsHave, ptrsMissing, err := bv.analyzeType(addr, t)
+	ptrsHave, ptrsMissing, err := compareGCBitvectorAndType(addr, bv.ptrSize, t, bv.isPointer)
 	if err != nil {
 		return err
 	}
@@ -187,7 +198,96 @@ func (bv *gcBitvector) checkPreciseType(addr uint64, t Type) error {
 	return fmt.Errorf("mismatched types for %t at 0x%x: missing %d pointers of %d", t, addr, ptrsMissing, ptrsMissing+ptrsHave)
 }
 
-func (bv *gcBitvector) analyzeType(baseAddr uint64, t Type) (ptrsHave int, ptrsMissing int, err error) {
+func (bv *gcBitvector) String() string {
+	buf := &bytes.Buffer{}
+	fmt.Fprintf(buf, "gcBitvector{seg:%s nbits:%d bits:", bv.seg, bv.nbits)
+	writeBitvector(buf, bv.bits, int(bv.nbits))
+	buf.WriteString("}")
+	return buf.String()
+}
+
+// gcHeapBitvector contains a bitvector for a single heap object.
+// See runtime/mbitmap.go.
+type gcHeapBitvector struct {
+	baseAddr uint64 // base address of the struct
+	ptrSize  uint64
+	bits     dataSegment // bytes are in reverse order
+}
+
+func makeGCHeapBitvector(baseAddr, ptrSize uint64, bits dataSegment) gcHeapBitvector {
+	return gcHeapBitvector{baseAddr, ptrSize, bits}
+}
+
+// test reports whether addr is a pointer. If addr is not a pointer
+// and there are no more pointers after addr, then mightHaveMore is false.
+//
+// test panics if addr is out-of-range or not pointer-aligned.
+// Panicking on bad addrs is necessary because certain offsets within a
+// bitvector have special meaning; see the "checkmarking" comment below.
+func (bv gcHeapBitvector) test(addr uint64) (isPointer bool, mightHaveMore bool) {
+	if addr%bv.ptrSize != 0 {
+		panic(fmt.Sprintf("addr 0x%x is not aligned to pointer size %d", addr, bv.ptrSize))
+	}
+	off := (addr - bv.baseAddr) / bv.ptrSize
+	byteVal := bv.bits.data[bv.baseAddr+bv.bits.size()-off/4-1] >> (off & 3)
+	// See runtime/mbitmap.go:hbits.morePointers.
+	// If the high bit is zero, there are no more pointers, except
+	// for the second word, where the high bit is used for checkmarking.
+	isPointer = (byteVal & 1) != 0
+	if addr != bv.baseAddr+bv.ptrSize {
+		mightHaveMore = (byteVal & (1 << 4)) != 0
+	}
+	return isPointer, mightHaveMore
+}
+
+// foreachPointer calls fn for each pointer in the range [addr, addr+size).
+// addr must be pointer-aligned.
+func (bv gcHeapBitvector) foreachPointer(addr, size uint64, fn func(ptrValue uint64)) {
+	for end := addr + size; addr < end; addr += bv.ptrSize {
+		isPointer, mightHaveMore := bv.test(addr)
+		if isPointer {
+			fn(addr)
+		}
+		if !mightHaveMore {
+			return
+		}
+	}
+}
+
+// checkPreciseType checks if a type at the given address has exactly the
+// pointers described by bv. Returns an error if not.
+func (bv gcHeapBitvector) checkPreciseType(addr uint64, t Type) error {
+	ptrsHave, ptrsMissing, err := compareGCBitvectorAndType(addr, bv.ptrSize, t, func(addr uint64) (isPtr bool) {
+		if addr%bv.ptrSize == 0 {
+			isPtr, _ = bv.test(addr)
+		}
+		return isPtr
+	})
+	if err != nil {
+		return err
+	}
+	if ptrsMissing == 0 {
+		return nil
+	}
+	return fmt.Errorf("mismatched types for %t at 0x%x: missing %d pointers of %d", t, addr, ptrsMissing, ptrsMissing+ptrsHave)
+}
+
+func (bv gcHeapBitvector) String() string {
+	buf := &bytes.Buffer{}
+	fmt.Fprintf(buf, "gcHeapBitvector{addr:%s bits:", bv.baseAddr)
+	writeBitvector(buf, bv.bits.data, int(bv.bits.size()/bv.ptrSize))
+	buf.WriteString("}")
+	return buf.String()
+}
+
+// compareGCBitvectorAndType is compares an object at baseAddr of type t
+// with the GC bitvector abstracted by gcIsPtr. The return values are:
+//
+//   - ptrsHave counts the number of pointers that match in t and the bitvector
+//   - ptrsMissing counts the number of points in t missing from the bitvector
+//   - err is non-nil if any pointer in the bitvector is missing from t
+//
+func compareGCBitvectorAndType(baseAddr, ptrSize uint64, t Type, gcIsPtr func(addr uint64) bool) (ptrsHave int, ptrsMissing int, err error) {
 	var visit func(addr uint64, t Type, path string) error
 	visit = func(addr uint64, t Type, path string) error {
 		if rep := t.InternalRepresentation(); rep != nil {
@@ -195,8 +295,8 @@ func (bv *gcBitvector) analyzeType(baseAddr uint64, t Type) (ptrsHave int, ptrsM
 		}
 		if !t.containsPointers() {
 			end := addr + t.Size()
-			for addr = roundDown(addr, bv.ptrSize); addr < end; addr += bv.ptrSize {
-				if bv.has(addr) {
+			for addr = roundDown(addr, ptrSize); addr < end; addr += ptrSize {
+				if gcIsPtr(addr) {
 					return fmt.Errorf("(0x%x)%s has type %s, but gcBitvector expects a pointer", baseAddr, path, t)
 				}
 			}
@@ -212,8 +312,8 @@ func (bv *gcBitvector) analyzeType(baseAddr uint64, t Type) (ptrsHave int, ptrsM
 			}
 			return nil
 
-		case *PtrType, *FuncType:
-			if bv.has(addr) {
+		case *PtrType, *UnsafePtrType, *FuncType:
+			if gcIsPtr(addr) {
 				ptrsHave++
 			} else {
 				ptrsMissing++
@@ -239,14 +339,6 @@ func (bv *gcBitvector) analyzeType(baseAddr uint64, t Type) (ptrsHave int, ptrsM
 
 	err = visit(baseAddr, t, "")
 	return ptrsHave, ptrsMissing, err
-}
-
-func (bv *gcBitvector) String() string {
-	buf := &bytes.Buffer{}
-	fmt.Fprintf(buf, "gcBitvector{seg:%s nbits:%d bits:", bv.seg, bv.nbits)
-	writeBitvector(buf, bv.bits, int(bv.nbits))
-	buf.WriteString("}")
-	return buf.String()
 }
 
 func writeBitvector(buf *bytes.Buffer, bits []byte, nbits int) {

@@ -46,11 +46,23 @@ type RuntimeLibrary struct {
 	HeapObjects runtimeHeapObjects
 
 	// Memory areas known to or managed by the runtime library.
-	// TODO: heapSegments dataSegments // the heap, from runtime.mheap_start XXX
-	// TODO: heap mark bitmaps as dataSegments?
 	moduledatas []*runtimeModuleData // from runtime.moduledata
+	mheapArena  dataSegment          // from runtime.mheap_: [arena_start, arena_used)
+	mheapBitmap dataSegment          // from runtime.mheap_: [bitmap - bitmap_mapped, bitmap)
+	mheapSpans  Value                // DerefArray version of runtime.mheap_.spans
 
-	// Fields used for type conversions from the runtime type structures.
+	// Types and fields used for heap traversal.
+	mspantypeType       Type        // runtime.mspan
+	mspanStartAddrField StructField // runtime.mspan.startAddr
+	mspanNpagesField    StructField // runtime.mspan.npages
+	mspanFreeindexField StructField // runtime.mspan.freeindex
+	mspanNelemsField    StructField // runtime.mspan.nelems
+	mspanAllocBitsField StructField // runtime.mspan.allocBits
+	mspanStateField     StructField // runtime.mspan.state
+	mspanElemsizeField  StructField // runtime.mspan.elemsize
+	mspanLimitField     StructField // runtime.mspan.limit
+
+	// Types and fields used for type conversions from the runtime type structures.
 	itabTypeField            StructField // runtime.itab._type
 	typeType                 Type        // runtime._type
 	typeSizeField            StructField // runtime._type.size
@@ -96,9 +108,184 @@ type runtimeHeapObjects struct{ p *Program }
 // RegisteredFinalizer describes a finalizer that has been registered with the
 // runtime library via runtime.SetFinalizer.
 // TODO: Can we infer the Go types of Obj and Fn from runtime metadata?
+// TODO: Finalizers are not yet supported
 type RegisteredFinalizer struct {
 	Obj Value // the object to finalize
 	Fn  Value // the finalizer function to run when Obj is garbage collected
+}
+
+type runtimeMSpan struct {
+	base      uint64
+	npages    uint64
+	freeindex uint64
+	nelems    uint64
+	allocBits dataSegment
+	state     uint64
+	elemsize  uint64
+	limit     uint64
+}
+
+func (rt *RuntimeLibrary) readMSpan(idx uint64) (*runtimeMSpan, error) {
+	spanPtr, err := rt.mheapSpans.Index(idx)
+	if err != nil {
+		logf("unexpected error in mheap.spans[%d]: %v", idx, err)
+		return nil, err
+	}
+	if spanPtr.IsZero() {
+		return nil, ErrNil
+	}
+	span, err := spanPtr.Deref()
+	if err != nil {
+		logf("unexpected error in *mheap.spans[%d] (0x%x): %v", idx, spanPtr.ReadUint(), err)
+		return nil, err
+	}
+
+	s := &runtimeMSpan{}
+	var allocBitsAddr uint64
+	fields := []struct {
+		x *uint64
+		f StructField
+	}{
+		{&s.base, rt.mspanStartAddrField},
+		{&s.npages, rt.mspanNpagesField},
+		{&s.freeindex, rt.mspanFreeindexField},
+		{&s.nelems, rt.mspanNelemsField},
+		{&allocBitsAddr, rt.mspanAllocBitsField},
+		{&s.state, rt.mspanStateField},
+		{&s.elemsize, rt.mspanElemsizeField},
+		{&s.limit, rt.mspanLimitField},
+	}
+	for _, f := range fields {
+		*f.x, err = span.ReadUintField(f.f)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var ok bool
+	s.allocBits, ok = rt.Program.dataSegments.slice(allocBitsAddr, (s.nelems+7)/8)
+	if !ok {
+		err := fmt.Errorf("could not load mheap.spans[%d].allocBits from mspan 0x%x, allocBits 0x%x, nelem %d",
+			idx, spanPtr.ReadUint(), allocBitsAddr, s.nelems)
+		logf("unexpected error: %v", err)
+		return nil, err
+	}
+
+	return s, nil
+}
+
+// FindHeapObject returns a Value representing the heap allocation slot that
+// contains v. The returned value always has GCObjectType. For example, the
+// following struct is 21 bytes, but might be allocated in a 24-byte slot:
+//
+//    type foo struct { x uint64, buf [13]byte }
+//
+// Given that v is &foo{}, or &foo{}.x, or &foo{}.buf[5], then FindHeapSlot(v)
+// returns a value of type GCObjectType, size 24, and address &foo{}.
+//
+// FindHeapObject returns false if v is not wholly contained within a
+// currently allocated heap object.
+func (rt *RuntimeLibrary) FindHeapObject(v Value) (Value, bool) {
+	// See runtime/mbitmap.go:heapBitsForObject.
+	if !rt.mheapArena.contains(v.Addr) {
+		return Value{}, false
+	}
+	const _PageShift = 13 // see runtime._PageShift
+	const _MSpanInUse = 1 // see runtime._MSpanInUse
+	spanIdx := (v.Addr - rt.mheapArena.addr) >> _PageShift
+	span, err := rt.readMSpan(spanIdx)
+	if err != nil || v.Addr < span.base || v.Addr >= span.limit || span.state != _MSpanInUse {
+		return Value{}, false
+	}
+	objIdx := (v.Addr - span.base) / span.elemsize
+
+	// See runtime/mbitmap.go:mspan.isFree.
+	if objIdx >= span.freeindex {
+		return Value{}, false
+	}
+	mask := uint8(1) << (objIdx % 8)
+	if isFree := (span.allocBits.data[objIdx/8] & mask) == 0; isFree {
+		return Value{}, false
+	}
+
+	baseAddr := span.base + objIdx*span.elemsize
+	obj, err := rt.Program.Value(baseAddr, rt.Program.MakeGCObjectType(span.elemsize))
+	if err != nil {
+		logf("unexpected error loading value from 0x%x, size 0x%x: %v", baseAddr, span.elemsize, err)
+		return Value{}, false
+	}
+	return obj, true
+}
+
+// heapBitsForAddr returns the GC bitmap for the given heap object,
+// which must have been generated by FindHeapObject.
+// See runtime/mbitmap.go:heapBitsForAddr.
+func (rt *RuntimeLibrary) heapBitsForAddr(v Value) gcHeapBitvector {
+	ptrSize := uint64(rt.Arch.PointerSize)
+	panic("TODO: the following logic is incorrect: (addr-arena.addr)/ptrsize gives the top byte")
+	off := (v.Addr - rt.mheapArena.addr) / ptrSize
+	bitmapTop := rt.mheapBitmap.addr + rt.mheapBitmap.size()
+	bits, ok := rt.mheapBitmap.slice(bitmapTop-off/4-1, roundUp(v.Size(), ptrSize))
+	if !ok {
+		panic(fmt.Sprintf("heapbits out-of-range for value at addr=0x%x, size=0x%x", v.Addr, v.Size()))
+	}
+	return makeGCHeapBitvector(v.Addr, ptrSize, bits)
+}
+
+// foreachGCPointer calls fn with each GC-visible pointer in Value.
+// The Value is assumed to be derived from a single program value
+// (i.e., a single Var or heap object).
+func (rt *RuntimeLibrary) foreachGCPointer(v Value, fn func(ptrValue uint64)) {
+	ptrSize := uint64(rt.Arch.PointerSize)
+	endAddr := v.Addr + v.Size()
+	startAddr := roundUp(v.Addr, ptrSize)
+	if startAddr >= endAddr {
+		return
+	}
+
+	// Heap?
+	if heapObj, ok := rt.FindHeapObject(v); ok {
+		bv := rt.heapBitsForAddr(heapObj)
+		bv.foreachPointer(startAddr, endAddr-startAddr, fn)
+		return
+	}
+
+	// Global?
+	for _, md := range rt.moduledatas {
+		if md.data.contains(startAddr) {
+			md.gcdatabv.foreachPointer(startAddr, endAddr-startAddr, fn)
+			return
+		}
+		if md.bss.contains(startAddr) {
+			md.gcbssbv.foreachPointer(startAddr, endAddr-startAddr, fn)
+			return
+		}
+		if md.noptrdata.contains(startAddr) || md.noptrbss.contains(startAddr) {
+			return
+		}
+	}
+
+	// Stack?
+	// TODO: more efficient search for large stacks?
+	findStack := func(gs []*Goroutine) *gcBitvector {
+		for _, g := range gs {
+			for sf := g.Stack; sf != nil; sf = sf.Callee {
+				if sf.argsBV.contains(startAddr) {
+					return sf.argsBV
+				}
+				if sf.localsBV.contains(startAddr) {
+					return sf.localsBV
+				}
+			}
+		}
+		return nil
+	}
+	bv := findStack(rt.Program.Goroutines)
+	if bv == nil {
+		bv = findStack(rt.Goroutines)
+	}
+	if bv != nil {
+		bv.foreachPointer(startAddr, endAddr-startAddr, fn)
+	}
 }
 
 // runtimeModuleData mirrors runtime.moduledata.
@@ -108,33 +295,20 @@ type runtimeModuleData struct {
 	findfunctab  uint64
 	minpc, maxpc uint64
 
-	data  dataSegment // [moduledata.data, moduledata.edata)
-	bss   dataSegment // [moduledata.bss, moduledata.ebss)
-	types dataSegment // [moduledata.types, moduledata.etypes)
-	// TODO: datagcmask, databssmask
+	data      dataSegment // [moduledata.data, moduledata.edata)
+	bss       dataSegment // [moduledata.bss, moduledata.ebss)
+	noptrdata dataSegment // [moduledata.noptrdata, moduledata.enoptrdata)
+	noptrbss  dataSegment // [moduledata.noptrbss, moduledata.enoptrbss)
+	types     dataSegment // [moduledata.types, moduledata.etypes)
+
+	gcdatabv *gcBitvector // moduledata.gcdatamask
+	gcbssbv  *gcBitvector // moduledata.gcbssmask
 }
 
 // runtimeFunctab mirrors runtime.functab.
 type runtimeFunctab struct {
 	entry   uint64
 	funcoff uint64
-}
-
-// ValueToHeapSlot returns a Value representing the heap allocation slot
-// that contains v. The returned value always has GCObjectType. For example,
-// the following struct is 21 bytes, but might be allocated in a 24-byte slot:
-//
-//    type foo struct { x uint64, buf [13]byte }
-//
-// Given that v is &foo{}, or &foo{}.x, or &foo{}.buf[5], then ValueToHeapSlot(v)
-// returns a value of type GCObjectType, size 24, and address &foo{}.
-//
-// Returns an error if v spans multiple heap slots or if v is not allocated
-// on the heap.
-//
-// TODO: see runtime/mbitmap.go:heapBitsForObject
-func (rt *RuntimeLibrary) ValueToHeapSlot(v Value) (Value, error) {
-	panic("not implemented")
 }
 
 // initialize rt. Must be called after global variables have been loaded.
@@ -170,6 +344,9 @@ func (rt *RuntimeLibrary) initialize(threads []*OSThread) error {
 		return err
 	}
 	if err := init.loadModuleData(); err != nil {
+		return err
+	}
+	if err := init.loadHeapInfo(); err != nil {
 		return err
 	}
 	if err := init.loadThreads(threads); err != nil {
@@ -274,6 +451,19 @@ func (init *runtimeInitializer) loadImportantTypes() error {
 			verbosef("loaded %s.%s, type %s, offset %d", structName, fieldName, fptr.Type, fptr.Offset)
 		}
 		return nil
+	}
+
+	if err := loadFields("runtime.mspan", &rt.mspantypeType, map[string]*StructField{
+		"startAddr": &rt.mspanStartAddrField,
+		"npages":    &rt.mspanNpagesField,
+		"freeindex": &rt.mspanFreeindexField,
+		"nelems":    &rt.mspanNelemsField,
+		"allocBits": &rt.mspanAllocBitsField,
+		"state":     &rt.mspanStateField,
+		"elemsize":  &rt.mspanElemsizeField,
+		"limit":     &rt.mspanLimitField,
+	}); err != nil {
+		return err
 	}
 
 	if err := loadFields("runtime.itab", nil, map[string]*StructField{
@@ -505,15 +695,35 @@ func (init *runtimeInitializer) loadModuleData() error {
 				return dataSegment{}, err
 			}
 			// TODO: We currently assume [start, end-start) does not span multiple
-			// program data segments. This is almost surely an invalid assumption,
-			// especially if global data was only partially dirtied. We should instead
-			// return a list of data segments.
+			// program data segments. This is might be an invalid assumption,
+			// especially if global data was only partially dirtied. We should
+			// instead return a list of dataSegments.
 			verbosef("loading module segment %s [0x%x, 0x%x)", startfield, start, end)
 			s, ok := rt.Program.dataSegments.slice(start, end-start)
 			if !ok {
-				return dataSegment{}, fmt.Errorf("module segment not found: %s [0x%x, 0x%x)", startfield, start, end)
+				return dataSegment{}, fmt.Errorf("module segment %s [0x%x, 0x%x) not found", startfield, start, end)
 			}
 			return s, nil
+		}
+		readBitvector := func(field string, seg dataSegment) (*gcBitvector, error) {
+			bv, err := md.FieldByName(field) // runtime.bitvector
+			if err != nil {
+				return nil, err
+			}
+			nbits, err := bv.ReadUintFieldByName("n")
+			if err != nil {
+				return nil, err
+			}
+			bitsAddr, err := bv.ReadUintFieldByName("bytedata")
+			if err != nil {
+				return nil, err
+			}
+			verbosef("loading global bitvector %s with %d bits at 0x%x", field, nbits, bitsAddr)
+			bits, ok := rt.Program.dataSegments.slice(bitsAddr, (nbits+7)/8)
+			if !ok {
+				return nil, fmt.Errorf("global bitvector %s at 0x%x not found", field, bitsAddr)
+			}
+			return newGCBitvector(rt.Program, seg, bits.data, nbits), nil
 		}
 
 		var err error
@@ -526,7 +736,23 @@ func (init *runtimeInitializer) loadModuleData() error {
 		if err != nil {
 			return err
 		}
+		moduledata.noptrdata, err = readSegment("noptrdata", "enoptrdata")
+		if err != nil {
+			return err
+		}
+		moduledata.noptrbss, err = readSegment("noptrbss", "enoptrbss")
+		if err != nil {
+			return err
+		}
 		moduledata.types, err = readSegment("types", "etypes")
+		if err != nil {
+			return err
+		}
+		moduledata.gcdatabv, err = readBitvector("gcdatamask", moduledata.data)
+		if err != nil {
+			return err
+		}
+		moduledata.gcbssbv, err = readBitvector("gcbssmask", moduledata.bss)
 		if err != nil {
 			return err
 		}
@@ -591,6 +817,73 @@ func (init *runtimeInitializer) loadModuleData() error {
 			return err
 		}
 	}
+}
+
+func (init *runtimeInitializer) loadHeapInfo() error {
+	logf("RuntimeLibrary: loading heap info")
+	rt := init.rt
+
+	mheap, ok := rt.Vars.FindName("runtime.mheap_")
+	if !ok {
+		return errors.New("could not find runtime.mheap_")
+	}
+
+	// mheapArena.
+	arenaStart, err := mheap.Value.ReadUintFieldByName("arena_start")
+	if err != nil {
+		return err
+	}
+	arenaUsed, err := mheap.Value.ReadUintFieldByName("arena_used")
+	if err != nil {
+		return err
+	}
+	rt.mheapArena, ok = rt.Program.dataSegments.slice(arenaStart, arenaUsed-arenaStart)
+	if !ok {
+		return fmt.Errorf("failed to load heap arena start=0x%x used=0x%x", arenaStart, arenaUsed)
+	}
+	logf("loaded heap arena %s", rt.mheapArena)
+
+	// mheapBitmap.
+	bitmapTop, err := mheap.Value.ReadUintFieldByName("bitmap")
+	if err != nil {
+		return err
+	}
+	bitmapMapped, err := mheap.Value.ReadUintFieldByName("bitmap_mapped")
+	if err != nil {
+		return err
+	}
+	rt.mheapBitmap, ok = rt.Program.dataSegments.slice(bitmapTop-bitmapMapped, bitmapMapped)
+	if !ok {
+		return fmt.Errorf("failed to load heap bitmap top=0x%x mapped=0x%x", bitmapTop, bitmapMapped)
+	}
+	logf("loaded heap bitmap %s", rt.mheapBitmap)
+
+	// mheapSpans.
+	// cap(mheap.spans) potentially covers more memory than was actually
+	// allocated by the process -- see comments at runtime.mheap.spans.
+	// This means spans.DerefArray with fail with ErrOutOfBounds. Instead,
+	// we do a manual version of DerefArray that uses len instead of cap.
+	spans, err := mheap.Value.FieldByName("spans")
+	if err != nil {
+		return err
+	}
+	numSpans, err := spans.Len()
+	if err != nil {
+		return err
+	}
+	spansElemType := spans.Type.(*SliceType).Elem
+	spans.Type = spans.Type.InternalRepresentation()
+	spansAddr, err := spans.ReadUintField(spans.Type.(*StructType).Fields[sliceArrayField])
+	if err != nil {
+		return err
+	}
+	rt.mheapSpans, err = rt.Program.Value(spansAddr, rt.Program.MakeArrayType(spansElemType, numSpans))
+	if err != nil {
+		return err
+	}
+	logf("loaded heap spans with %d entries", numSpans)
+
+	return nil
 }
 
 func (init *runtimeInitializer) loadThreads(threads []*OSThread) error {
@@ -1151,7 +1444,12 @@ func (init *runtimeInitializer) getFuncStackmap(fdesc Value, pc, sp, fp uint64, 
 		panic(fmt.Sprintf("unexpected which=%d", which))
 	}
 
-	return newGCBitvector(init.rt.Program, s, stkmapBytedata.Addr+uint64(pcdata)*((stkmapNbit+7)/8), stkmapNbit)
+	bitsAddr := stkmapBytedata.Addr + uint64(pcdata)*((stkmapNbit+7)/8)
+	bits, ok := init.rt.Program.dataSegments.slice(bitsAddr, (stkmapNbit+7)/8)
+	if !ok {
+		return nil, fmt.Errorf("error loading bitvector with %d bits at at 0x%x", bitsAddr, stkmapNbit)
+	}
+	return newGCBitvector(init.rt.Program, s, bits.data, stkmapNbit), nil
 }
 
 // See runtime/symtab.go:pcdatavalue.

@@ -331,8 +331,8 @@ func (v Value) Cap() (uint64, error) {
 }
 
 // ReadScalar parses v into a Go scalar value. NumericType becomes the
-// corresponding Go type. PtrType becomes uint64. ReadScalar will panic
-// if called for any other type.
+// corresponding Go type. PtrType and UnsafePtrType become uint64.
+// ReadScalar will panic if called for any other type.
 func (v Value) ReadScalar() interface{} {
 	a := v.Type.Program().RuntimeLibrary.Arch
 
@@ -368,7 +368,7 @@ func (v Value) ReadScalar() interface{} {
 		}
 		panic(fmt.Sprintf("bad numeric type for Value.ReadScalar(): %s (%T)", t, t))
 
-	case *PtrType:
+	case *PtrType, *UnsafePtrType:
 		return a.Uintptr(v.Bytes)
 
 	default:
@@ -380,7 +380,8 @@ func (v Value) ReadScalar() interface{} {
 // by a conversion to uint64. Panics if v is not an integer or pointer.
 func (v Value) ReadUint() uint64 {
 	a := v.Type.Program().RuntimeLibrary.Arch
-	if t, ok := v.Type.(*NumericType); ok {
+	switch t := v.Type.(type) {
+	case *NumericType:
 		switch t.Kind {
 		case NumericUint8:
 			return uint64(v.Bytes[0])
@@ -391,8 +392,7 @@ func (v Value) ReadUint() uint64 {
 		case NumericUint64, NumericInt64:
 			return uint64(a.Uint64(v.Bytes))
 		}
-	}
-	if _, ok := v.Type.(*PtrType); ok {
+	case *PtrType, *UnsafePtrType:
 		return a.Uintptr(v.Bytes)
 	}
 	panic(fmt.Sprintf("bad type for Value.ReadUint(): %s (%T)", v.Type, v.Type))
@@ -487,7 +487,7 @@ func (v Value) WriteScalar(x interface{}) {
 			a.FloatByteOrder.PutUint64(v.Bytes[8:16], math.Float64bits(float64(imag(c))))
 		}
 
-	case *PtrType:
+	case *PtrType, *UnsafePtrType:
 		switch a.PointerSize {
 		case 4:
 			a.ByteOrder.PutUint32(v.Bytes, uint32(reflect.ValueOf(x).Uint()))

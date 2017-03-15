@@ -189,6 +189,23 @@ func (t *PtrType) containsPointers() bool {
 	return true
 }
 
+// UnsafePtrType is the type of unsafe.Pointer.
+type UnsafePtrType struct {
+	baseType // always has a name ("unsafe.Pointer" by default)
+}
+
+func (t *UnsafePtrType) InternalRepresentation() Type {
+	return nil
+}
+
+func (t *UnsafePtrType) directIface() bool {
+	return true
+}
+
+func (t *UnsafePtrType) containsPointers() bool {
+	return true
+}
+
 // StructType is the type of structs.
 type StructType struct {
 	baseType
@@ -686,9 +703,9 @@ func (tc *typeCache) addDWARFWithTypedef(dt dwarf.Type, typename string) (Type, 
 		return t, nil
 
 	case *dwarf.PtrType:
-		if typename == "unsafe.Pointer" {
-			t := add(new(PtrType))
-			t.(*PtrType).initialize(tc, typename, tc.program.MakeGCObjectType(0))
+		if dt.Common().Name == "unsafe.Pointer" {
+			t := add(new(UnsafePtrType))
+			t.(*UnsafePtrType).initialize(tc, typename)
 			return t, nil
 		}
 		t := add(new(PtrType))
@@ -1419,11 +1436,7 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value, tflag uint64) (Type,
 		return t, nil
 
 	case rttKindUnsafePointer:
-		t := tc.program.FindType("unsafe.Pointer")
-		if t == nil {
-			return nil, errors.New("could not find type unsafe.Pointer")
-		}
-		return t, nil
+		return tc.program.MakeUnsafePtrType(), nil
 
 	default:
 		return nil, fmt.Errorf("unexpected kind %d", kind)
@@ -1465,6 +1478,16 @@ func (p *Program) MakePtrType(elem Type) *PtrType {
 	}
 	t := &PtrType{}
 	t.initialize(&p.typeCache, "", elem)
+	return t
+}
+
+// MakeUnsafePtrType returns the unsafe.Pointer type.
+func (p *Program) MakeUnsafePtrType() *UnsafePtrType {
+	if t := p.FindType("unsafe.Pointer"); t != nil {
+		return t.(*UnsafePtrType)
+	}
+	t := &UnsafePtrType{}
+	t.initialize(&p.typeCache, "unsafe.Pointer")
 	return t
 }
 
@@ -1575,6 +1598,14 @@ func (t *PtrType) initialize(tc *typeCache, fullname string, elem Type) {
 	tc.add(t, fullname, [2]interface{}{"PtrType", elem})
 }
 
+func (t *UnsafePtrType) initialize(tc *typeCache, fullname string) {
+	if fullname == "" {
+		panic("UnsafePtrType must have a name")
+	}
+	t.baseType.initialize(tc, fullname, uint64(tc.program.RuntimeLibrary.Arch.PointerSize))
+	tc.add(t, fullname, nil)
+}
+
 func (t *StructType) initialize(tc *typeCache, fullname string, fields []StructField, size uint64) {
 	sort.Sort(sortFieldByOffset(fields))
 	for k := range fields {
@@ -1677,6 +1708,9 @@ func isPtrToStruct(t Type) bool {
 }
 
 func isPtrField(f StructField) bool {
-	_, ok := f.Type.(*PtrType)
-	return ok || f.Type.String() == "unsafe.Pointer"
+	switch f.Type.(type) {
+	case *PtrType, *UnsafePtrType:
+		return true
+	}
+	return false
 }
