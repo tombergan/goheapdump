@@ -29,7 +29,8 @@ func roundUp(x, align uint64) uint64 {
 }
 
 // programBitvector has one bit for each pointer-aligned word in a
-// Program's virtual memory space.
+// Program's virtual memory space. This is used by Query for graph
+// reachability queries.
 //
 // TODO: support very large heaps
 // TODO: support concurrent updates
@@ -113,8 +114,8 @@ func (chunk *programBitvectorChunk) acquireRange(addrStart, size, ptrSize uint64
 type gcBitvector struct {
 	bits    []byte
 	nbits   uint64
-	seg     dataSegment // the bitvector covers addresses in this segment
 	ptrSize uint64
+	seg     dataSegment // the bitvector covers addresses in this segment
 }
 
 var gcEmptyBitvector = &gcBitvector{
@@ -133,8 +134,8 @@ func newGCBitvector(p *Program, seg dataSegment, bits []byte, nbits uint64) *gcB
 	return &gcBitvector{
 		bits:    bits,
 		nbits:   nbits,
-		seg:     seg,
 		ptrSize: ptrSize,
+		seg:     seg,
 	}
 }
 
@@ -201,21 +202,26 @@ func (bv *gcBitvector) checkPreciseType(addr uint64, t Type) error {
 func (bv *gcBitvector) String() string {
 	buf := &bytes.Buffer{}
 	fmt.Fprintf(buf, "gcBitvector{seg:%s nbits:%d bits:", bv.seg, bv.nbits)
-	writeBitvector(buf, bv.bits, int(bv.nbits))
+	writeBitvector(buf, bv.seg.addr, bv.seg.size(), bv.ptrSize, bv.isPointer)
 	buf.WriteString("}")
 	return buf.String()
 }
 
-// gcHeapBitvector contains a bitvector for a single heap object.
+// gcHeapBitvector describes a bitvector for a single heap object.
 // See runtime/mbitmap.go.
 type gcHeapBitvector struct {
-	baseAddr uint64 // base address of the struct
+	baseAddr uint64 // base address of the heap arena
+	objAddr  uint64 // base address of the object
+	objSize  uint64
 	ptrSize  uint64
-	bits     dataSegment // bytes are in reverse order
+	bitmap   []byte // the entire heap bitmap
 }
 
-func makeGCHeapBitvector(baseAddr, ptrSize uint64, bits dataSegment) gcHeapBitvector {
-	return gcHeapBitvector{baseAddr, ptrSize, bits}
+func makeGCHeapBitvector(baseAddr, objAddr, objSize, ptrSize uint64, bitmap []byte) gcHeapBitvector {
+	if objAddr%ptrSize != 0 {
+		panic(fmt.Sprintf("object addr 0x%x is not aligned to pointer size %d", objAddr, ptrSize))
+	}
+	return gcHeapBitvector{baseAddr, objAddr, objSize, ptrSize, bitmap}
 }
 
 // test reports whether addr is a pointer. If addr is not a pointer
@@ -228,13 +234,20 @@ func (bv gcHeapBitvector) test(addr uint64) (isPointer bool, mightHaveMore bool)
 	if addr%bv.ptrSize != 0 {
 		panic(fmt.Sprintf("addr 0x%x is not aligned to pointer size %d", addr, bv.ptrSize))
 	}
+	if addr >= bv.objAddr+bv.objSize {
+		panic(fmt.Sprintf("addr 0x%x is not inside object [0x%x, 0x%x)", addr, bv.objAddr, bv.objAddr+bv.objSize))
+	}
+	// See runtime/mbitmap.go:heapBitsForAddr.
+	// and runtime/mbitmap.go:heapBits.isPointer.
 	off := (addr - bv.baseAddr) / bv.ptrSize
-	byteVal := bv.bits.data[bv.baseAddr+bv.bits.size()-off/4-1] >> (off & 3)
+	byteVal := bv.bitmap[uint64(len(bv.bitmap))-off/4-1] >> (off & 3)
+	isPointer = (byteVal & 1) != 0
 	// See runtime/mbitmap.go:hbits.morePointers.
 	// If the high bit is zero, there are no more pointers, except
 	// for the second word, where the high bit is used for checkmarking.
-	isPointer = (byteVal & 1) != 0
-	if addr != bv.baseAddr+bv.ptrSize {
+	if addr == bv.objAddr+bv.ptrSize {
+		mightHaveMore = true
+	} else {
 		mightHaveMore = (byteVal & (1 << 4)) != 0
 	}
 	return isPointer, mightHaveMore
@@ -274,8 +287,11 @@ func (bv gcHeapBitvector) checkPreciseType(addr uint64, t Type) error {
 
 func (bv gcHeapBitvector) String() string {
 	buf := &bytes.Buffer{}
-	fmt.Fprintf(buf, "gcHeapBitvector{addr:%s bits:", bv.baseAddr)
-	writeBitvector(buf, bv.bits.data, int(bv.bits.size()/bv.ptrSize))
+	fmt.Fprintf(buf, "gcHeapBitvector{addr:0x%x bits:", bv.baseAddr)
+	writeBitvector(buf, bv.objAddr, bv.objSize, bv.ptrSize, func(addr uint64) bool {
+		isPtr, _ := bv.test(addr)
+		return isPtr
+	})
 	buf.WriteString("}")
 	return buf.String()
 }
@@ -341,20 +357,12 @@ func compareGCBitvectorAndType(baseAddr, ptrSize uint64, t Type, gcIsPtr func(ad
 	return ptrsHave, ptrsMissing, err
 }
 
-func writeBitvector(buf *bytes.Buffer, bits []byte, nbits int) {
-	for k := range bits {
-		b := bits[k]
-		for i := 0; i < 8 && i < nbits; i++ {
-			if b&1 != 0 {
-				buf.WriteString("1")
-			} else {
-				buf.WriteString("0")
-			}
-			b >>= 1
+func writeBitvector(buf *bytes.Buffer, startAddr, size, ptrSize uint64, isPtr func(addr uint64) bool) {
+	for addr := startAddr; addr < startAddr+size; addr += ptrSize {
+		if isPtr(addr) {
+			buf.WriteString("1")
+		} else {
+			buf.WriteString("0")
 		}
-		if nbits < 8 {
-			return
-		}
-		nbits -= 8
 	}
 }
