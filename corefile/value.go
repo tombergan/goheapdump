@@ -46,6 +46,8 @@ var (
 )
 
 // Value describes a typed region of memory.
+// If the core file was opened in writable mode, then updates to Bytes will be
+// reflected in the core file. Otherwise, attempts to update Bytes may segfault.
 type Value struct {
 	Type  Type
 	Addr  uint64 // base address of Bytes
@@ -434,26 +436,11 @@ func (v Value) ReadUintFieldByName(name string) (uint64, error) {
 	return fv.ReadUint(), nil
 }
 
-// IsWritable reports whether v is wholly contained in writable memory segments.
-// If this is true, then updates to v.Bytes will be reflected in the core file.
-// If this is false, then updates to v.Bytes may segfault.
-// Always returns false if the core file was not opened in writable mode.
-//
-// Writing to a value allows updating a core file; for example, to sanitize private
-// or personally-identifying data.
-func (v *Value) IsWritable() bool {
-	ds, found := v.Type.Program().dataSegments.findSegment(v.Addr)
-	return found && ds.writable && ds.containsRange(v.Addr, v.Type.Size())
-}
-
-// WriteScalar overwrites v in the core file. WriteScalar is the inverse of ReadScalar.
-// Panics if !v.IsWritable(), if v has a non-scalar type, or if the type of x is not
-// compatible with v.Type.
+// WriteScalar overwrites v. WriteScalar is the inverse of ReadScalar.
+// If the core file was opened in writable mode, then this write will be reflected
+// in the core file. Otherwise, this write may segfault. WriteScalar panics if v
+// has a non-scalar type or if the type of x is not compatible with v.Type.
 func (v Value) WriteScalar(x interface{}) {
-	if !v.IsWritable() {
-		panic(fmt.Sprintf("value at addr 0x%x, type %s (%T) is not writable", v.Addr, v.Type, v.Type))
-	}
-
 	a := v.Type.Program().RuntimeLibrary.Arch
 
 	switch t := v.Type.(type) {

@@ -93,12 +93,17 @@ func readELF(mmapf *mmapFile, f *elf.File, rp *rawProgram, writable, isCoreFile 
 	}
 	sort.Sort(progs)
 
-	// Merge adjacent segments that have the same R/W mode.
+	// Merge adjacent segments. A segment is adjacent to the previous
+	// segment if the previous segment is entirely described in the ELF
+	// file and ends at the current segment.
+	//
+	// TODO: Currently we load non-readable segments as ordinary segments.
+	// Should we instead discard non-readable segments, so they're not mapped
+	// in the Program, or perhaps mark them specially?
 	for k := 1; k < len(progs); {
 		prev := &progs[k-1]
 		curr := &progs[k]
-		sameMode := (prev.Flags&(elf.PF_W|elf.PF_R) == curr.Flags&(elf.PF_W|elf.PF_R))
-		if sameMode && prev.Memsz == prev.Filesz && prev.Vaddr+prev.Memsz == curr.Vaddr && prev.Off+prev.Filesz == curr.Off {
+		if prev.Memsz == prev.Filesz && prev.Vaddr+prev.Memsz == curr.Vaddr && prev.Off+prev.Filesz == curr.Off {
 			verbosef("ReadELF: merging:\n%#v\n%#v", *prev, *curr)
 			prev.Memsz += curr.Memsz
 			prev.Filesz += curr.Filesz
@@ -119,10 +124,8 @@ func readELF(mmapf *mmapFile, f *elf.File, rp *rawProgram, writable, isCoreFile 
 					return dataSegment{}, fmt.Errorf("bad ELF segment %+v: %v", ph, err)
 				}
 				return dataSegment{
-					addr:     ph.Vaddr,
-					data:     data,
-					writable: writable && (ph.Flags&elf.PF_W) != 0,
-					readable: (ph.Flags & elf.PF_R) != 0,
+					addr: ph.Vaddr,
+					data: data,
 				}, nil
 			})
 			if err != nil {
@@ -144,10 +147,8 @@ func readELF(mmapf *mmapFile, f *elf.File, rp *rawProgram, writable, isCoreFile 
 					return dataSegment{}, fmt.Errorf("MAP_ANONYMOUS failed on size=%v: %v", size, err)
 				}
 				return dataSegment{
-					addr:     ph.Vaddr + ph.Filesz,
-					data:     anonf.data,
-					writable: false, // writes to this segment cannot be reflected back into the core file
-					readable: true,
+					addr: ph.Vaddr + ph.Filesz,
+					data: anonf.data,
 				}, nil
 			})
 			if err != nil {

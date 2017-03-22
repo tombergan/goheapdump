@@ -9,25 +9,10 @@ import (
 type dataSegment struct {
 	addr uint64
 	data []byte // points to mmap’d files
-
-	// writable is true if the memory range was writable by the program
-	// and the core file was mapped in writable mode.
-	writable bool
-
-	// readable is true if the memory range was readable by the program.
-	// e.g., this is false for stack guards.
-	readable bool
 }
 
 func (s dataSegment) String() string {
-	mode := ""
-	if s.readable {
-		mode += "R"
-	}
-	if s.writable {
-		mode += "W"
-	}
-	return fmt.Sprintf("dataSegment{addr:0x%x, size:0x%x, mode:%v}", s.addr, s.size(), mode)
+	return fmt.Sprintf("dataSegment{addr: 0x%x, size: 0x%x}", s.addr, s.size())
 }
 
 // contains reports whether the segment contains the given address.
@@ -53,10 +38,8 @@ func (s dataSegment) slice(addr, size uint64) (dataSegment, bool) {
 		return dataSegment{}, false
 	}
 	return dataSegment{
-		addr:     addr,
-		data:     s.data[offset : offset+size : offset+size],
-		writable: s.writable,
-		readable: s.readable,
+		addr: addr,
+		data: s.data[offset : offset+size : offset+size],
 	}, true
 }
 
