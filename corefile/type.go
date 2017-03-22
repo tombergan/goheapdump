@@ -709,6 +709,7 @@ func (tc *typeCache) addDWARFWithTypedef(dt dwarf.Type, typename string) (Type, 
 			return t, nil
 		}
 		t := add(new(PtrType))
+		t.base().size = uint64(tc.program.RuntimeLibrary.Arch.PointerSize) // set now in case t is referenced recursivelsy
 		elem, err := tc.addDWARF(dt.Type)
 		if err != nil {
 			return nil, err
@@ -730,6 +731,7 @@ func (tc *typeCache) addDWARFWithTypedef(dt dwarf.Type, typename string) (Type, 
 			return nil, fmt.Errorf("DWARF incomplete structs are not supported (type is %s)", dt)
 		}
 		t := add(new(StructType))
+		t.base().size = uint64(dt.ByteSize) // set now in case t is referenced recursively
 		var fields []StructField
 		for _, df := range dt.Field {
 			tc.verbosef("field %s", df.Name)
@@ -910,6 +912,12 @@ func (tc *typeCache) addDWARFWithTypedef(dt dwarf.Type, typename string) (Type, 
 	case *dwarf.UnspecifiedType:
 		// TODO: These are used for internal variables like $f64.* and go.itab.*.
 		// Why can't these internal variables have real types?
+		return add(tc.program.MakeGCObjectType(0)), nil
+
+	case *dwarf.VoidType:
+		// TODO: This seems to happen when Go generates a DW_TAG_pointer_type but
+		// for some reason (bug?) doesn't include the element type for that pointer.
+		tc.verbosef("dwarf.VoidType not supported")
 		return add(tc.program.MakeGCObjectType(0)), nil
 
 	// Unsupported types.
@@ -1333,10 +1341,11 @@ func (tc *typeCache) convertUnnamedRuntimeType(tdesc Value, tflag uint64) (Type,
 				return nil, err
 			}
 			tc.verbosef("field %s", fieldname)
-			offset, err := field.ReadUintField(rt.structfieldOffsetField)
+			offset, err := field.ReadUintField(rt.structfieldOffsetAnonField)
 			if err != nil {
 				return nil, err
 			}
+			offset = offset >> 1 // shift off "anon" bit
 			ftptr, err := field.Field(rt.structfieldTypeField)
 			if err != nil {
 				return nil, err

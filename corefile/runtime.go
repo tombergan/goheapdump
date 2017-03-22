@@ -63,37 +63,37 @@ type RuntimeLibrary struct {
 	mspanLimitField     StructField // runtime.mspan.limit
 
 	// Types and fields used for type conversions from the runtime type structures.
-	itabTypeField            StructField // runtime.itab._type
-	typeType                 Type        // runtime._type
-	typeSizeField            StructField // runtime._type.size
-	typeKindField            StructField // runtime._type.kind
-	typeTflagField           StructField // runtime._type.tflag
-	typeStrField             StructField // runtime._type.str
-	arraytypeType            Type        // runtime.arraytype
-	arraytypeLenField        StructField // runtime.arraytype.len
-	arraytypeElemField       StructField // runtime.arraytype.elem
-	ptrtypeType              Type        // runtime.ptrtype
-	ptrtypeElemField         StructField // runtime.ptrtype.elem
-	structtypeType           Type        // runtime.structtype
-	structtypeFieldsField    StructField // runtime.structtype.fields
-	structfieldType          Type        // runtime.structfield
-	structfieldNameField     StructField // runtime.structfield.name
-	structfieldTypeField     StructField // runtime.structfield.typ
-	structfieldOffsetField   StructField // runtime.structfield.offset
-	interfacetypeType        Type        // runtime.interfacetype
-	slicetypeType            Type        // runtime.slicetype
-	slicetypeElemField       StructField // runtime.slicetype.elem
-	chantypeType             Type        // runtime.chantype
-	chantypeDirField         StructField // runtime.chantype.dir
-	chantypeElemField        StructField // runtime.chantype.elem
-	maptypeType              Type        // runtime.maptype
-	maptypeKeyField          StructField // runtime.maptype.key
-	maptypeElemField         StructField // runtime.maptype.elem
-	uncommontypeType         Type        // runtime.uncommontype
-	uncommontypePkgPathField StructField // runtime.uncommontype.pkgPath
-	sliceRepType             *StructType // runtime.slice
-	chanRepType              *PtrType    // *runtime.hchan
-	mapRepType               *PtrType    // *runtime.hchan
+	itabTypeField              StructField // runtime.itab._type
+	typeType                   Type        // runtime._type
+	typeSizeField              StructField // runtime._type.size
+	typeKindField              StructField // runtime._type.kind
+	typeTflagField             StructField // runtime._type.tflag
+	typeStrField               StructField // runtime._type.str
+	arraytypeType              Type        // runtime.arraytype
+	arraytypeLenField          StructField // runtime.arraytype.len
+	arraytypeElemField         StructField // runtime.arraytype.elem
+	ptrtypeType                Type        // runtime.ptrtype
+	ptrtypeElemField           StructField // runtime.ptrtype.elem
+	structtypeType             Type        // runtime.structtype
+	structtypeFieldsField      StructField // runtime.structtype.fields
+	structfieldType            Type        // runtime.structfield
+	structfieldNameField       StructField // runtime.structfield.name
+	structfieldTypeField       StructField // runtime.structfield.typ
+	structfieldOffsetAnonField StructField // runtime.structfield.offsetAnon
+	interfacetypeType          Type        // runtime.interfacetype
+	slicetypeType              Type        // runtime.slicetype
+	slicetypeElemField         StructField // runtime.slicetype.elem
+	chantypeType               Type        // runtime.chantype
+	chantypeDirField           StructField // runtime.chantype.dir
+	chantypeElemField          StructField // runtime.chantype.elem
+	maptypeType                Type        // runtime.maptype
+	maptypeKeyField            StructField // runtime.maptype.key
+	maptypeElemField           StructField // runtime.maptype.elem
+	uncommontypeType           Type        // runtime.uncommontype
+	uncommontypePkgPathField   StructField // runtime.uncommontype.pkgPath
+	sliceRepType               *StructType // runtime.slice
+	chanRepType                *PtrType    // *runtime.hchan
+	mapRepType                 *PtrType    // *runtime.hchan
 
 	// Types used when looking into function stackmaps.
 	funcType           *StructType // runtime._func
@@ -310,12 +310,15 @@ func (rt *RuntimeLibrary) initialize(threads []*OSThread) error {
 	// Determine the runtime version.
 	// TODO: use this to guide the rest of the initialization to support multiple versions
 	if buildVersion, ok := rt.Vars.FindName("runtime.buildVersion"); !ok {
-		logf("WARNING: could not find runtime.buildVersion")
+		return fmt.Errorf("could not find runtime.buildVersion")
 	} else if s, err := buildVersion.Value.DerefArray(); err != nil {
-		logf("WARNING: could not load runtime.buildVersion: %v", err)
+		return fmt.Errorf("could not load runtime.buildVersion: %v", err)
 	} else {
 		rt.Version = string(s.Bytes)
 		logf("Go runtime version %s", rt.Version)
+		if rt.Version != "go1.8.typealias" {
+			return fmt.Errorf("go runtime version is %q but the only supported version is \"go1.8.typealias\"", rt.Version)
+		}
 	}
 
 	switch rt.GOARCH {
@@ -494,9 +497,9 @@ func (init *runtimeInitializer) loadImportantTypes() error {
 	}
 
 	if err := loadFields("runtime.structfield", &rt.structfieldType, map[string]*StructField{
-		"name":   &rt.structfieldNameField,
-		"typ":    &rt.structfieldTypeField,
-		"offset": &rt.structfieldOffsetField,
+		"name":       &rt.structfieldNameField,
+		"typ":        &rt.structfieldTypeField,
+		"offsetAnon": &rt.structfieldOffsetAnonField,
 	}); err != nil {
 		return err
 	}
@@ -575,9 +578,9 @@ func (init *runtimeInitializer) loadImportantTypes() error {
 
 	if rt.structfieldType == nil {
 		if err := loadFields("reflect.structField", &rt.structfieldType, map[string]*StructField{
-			"name":   &rt.structfieldNameField,
-			"typ":    &rt.structfieldTypeField,
-			"offset": &rt.structfieldOffsetField,
+			"name":       &rt.structfieldNameField,
+			"typ":        &rt.structfieldTypeField,
+			"offsetAnon": &rt.structfieldOffsetAnonField,
 		}); err != nil {
 			return err
 		}
